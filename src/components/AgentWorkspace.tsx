@@ -1,11 +1,23 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AuditEvent, ChallengeSessionDiagnostic, ListingProposal, ProductInspection, ProductSummary, PublishedProduct } from '@/domain/contracts';
 import { registerListingPilotTools } from '@/webmcp/register-tools';
 import { WEBMCP_RESULT_EVENT, type WebMcpResultEvent } from '@/webmcp/tool-results';
 
 type WebMcpState = 'checking' | 'ready' | 'unsupported' | 'error';
+
+const proposalStateRank: Record<ListingProposal['status'], number> = {
+  AWAITING_APPROVAL: 0,
+  APPROVED: 1,
+  PUBLISHED: 2,
+};
+
+function keepNewestProposal(current: ListingProposal | null, incoming: ListingProposal | null): ListingProposal | null {
+  if (!incoming) return current;
+  if (!current || current.proposalId !== incoming.proposalId) return incoming;
+  return proposalStateRank[incoming.status] >= proposalStateRank[current.status] ? incoming : current;
+}
 
 async function jsonRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, { ...init, credentials: 'include', cache: 'no-store' });
@@ -28,6 +40,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   const [sessionDiagnostic, setSessionDiagnostic] = useState<ChallengeSessionDiagnostic | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const activityRequestSequence = useRef(0);
 
   const applyPublishedProduct = useCallback((published: PublishedProduct) => {
     setProducts((current) => current.map((product) => product.productId === published.productId ? { ...product, title: published.title } : product));
@@ -35,9 +48,11 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   }, []);
 
   const loadActivity = useCallback(async () => {
+    const requestSequence = ++activityRequestSequence.current;
     const body = await jsonRequest<{ activity: AuditEvent[]; latestProposal: ListingProposal | null; publishedProducts: PublishedProduct[]; diagnostic: ChallengeSessionDiagnostic }>('/api/activity');
+    if (requestSequence !== activityRequestSequence.current) return;
     setActivity(body.activity);
-    setProposal(body.latestProposal);
+    setProposal((current) => keepNewestProposal(current, body.latestProposal));
     body.publishedProducts.forEach(applyPublishedProduct);
     setSessionDiagnostic(body.diagnostic);
   }, [applyPublishedProduct]);
@@ -50,8 +65,8 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
       const detail = (event as CustomEvent<WebMcpResultEvent>).detail;
       if (detail.kind === 'search') setProducts(detail.products);
       if (detail.kind === 'inspection') setInspection(detail.inspection);
-      if (detail.kind === 'proposal') setProposal(detail.proposal);
-      if (detail.kind === 'publish') { setProposal(detail.proposal); applyPublishedProduct(detail.result.publishedProduct); }
+      if (detail.kind === 'proposal') setProposal((current) => keepNewestProposal(current, detail.proposal));
+      if (detail.kind === 'publish') { setProposal((current) => keepNewestProposal(current, detail.proposal)); applyPublishedProduct(detail.result.publishedProduct); }
       setError(null);
       void loadActivity();
     };
@@ -85,10 +100,12 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
     if (!proposal) return;
     setBusy('approve'); setError(null);
     try {
-      const body = await jsonRequest<{ proposal: ListingProposal }>(`/api/proposals/${encodeURIComponent(proposal.proposalId)}/approve`, {
+      const body = await jsonRequest<{ proposal: ListingProposal; diagnostic: ChallengeSessionDiagnostic }>(`/api/proposals/${encodeURIComponent(proposal.proposalId)}/approve`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-listingpilot-human-action': 'review-ui' }, body: JSON.stringify({ humanConfirmation: true }),
       });
-      setProposal(body.proposal); await loadActivity();
+      setProposal((current) => keepNewestProposal(current, body.proposal));
+      setSessionDiagnostic(body.diagnostic);
+      await loadActivity();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Approval failed.'); }
     finally { setBusy(null); }
   }
@@ -163,6 +180,6 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
         <details className="activity"><summary>Recent bounded activity <span>{activity.length}</span></summary>{activity.map((event) => <div key={event.id}><i /><span><strong>{event.type.replaceAll('_', ' ')}</strong><small>{new Date(event.occurredAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></span></div>)}</details>
       </aside>
     </div>
-    <footer><span>Challenge workspace: Atlas Demo</span><span>Session: {sessionDiagnostic?.stateCookie === 'VALID' ? 'valid' : sessionDiagnostic ? 'new' : 'checking'} · Proposal: {sessionDiagnostic?.proposalState?.replaceAll('_', ' ').toLowerCase() ?? 'none'}</span><span>Synthetic data only · no OpenAI · no Shopify</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
+    <footer><span>Challenge workspace: Atlas Demo</span><span>Session: {sessionDiagnostic?.stateCookie === 'VALID' ? 'valid' : sessionDiagnostic ? 'new' : 'checking'} · Proposal: {(proposal?.status ?? sessionDiagnostic?.proposalState)?.replaceAll('_', ' ').toLowerCase() ?? 'none'}</span><span>Synthetic data only · no OpenAI · no Shopify</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
   </main>;
 }
