@@ -60,7 +60,7 @@ describe('inspection and safe preparation', () => {
 describe('human approval and agent publish boundary', () => {
   it('blocks publish before human approval and records the block', () => {
     const proposal = prepareListingImprovement(state, DEMO_WORKSPACE_ID, 'prod_northstar_dock12', 'full_listing');
-    expect(() => publishApprovedChanges(state, DEMO_WORKSPACE_ID, proposal.proposalId)).toThrowError(expect.objectContaining({ code: 'INVALID_TRANSITION' }));
+    expect(() => publishApprovedChanges(state, DEMO_WORKSPACE_ID, proposal.proposalId)).toThrowError(expect.objectContaining({ code: 'HUMAN_APPROVAL_REQUIRED' }));
     expect(state.publishedProducts).toHaveLength(0);
     expect(state.audit[0].type).toBe('PUBLISH_BLOCKED');
   });

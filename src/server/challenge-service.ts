@@ -125,7 +125,7 @@ export function publishApprovedChanges(state: ChallengeState, workspaceId: strin
   }
   if (proposal.status !== 'APPROVED' || !proposal.approvedAt) {
     record(state, 'PUBLISH_BLOCKED', proposal.productId, proposalId);
-    throw new ChallengeError('INVALID_TRANSITION', 'Human approval is required before publishing.', 409);
+    throw new ChallengeError('HUMAN_APPROVAL_REQUIRED', 'Human approval is required before publishing.', 409);
   }
   record(state, 'PUBLISH_ATTEMPTED', proposal.productId, proposalId);
   try {

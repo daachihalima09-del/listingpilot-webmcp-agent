@@ -130,6 +130,13 @@ export interface PublishResult {
   message: string;
 }
 
+export interface ChallengeSessionDiagnostic {
+  stateCookie: 'MISSING_NEW_SESSION' | 'VALID';
+  proposalCount: number;
+  proposalFound: boolean | null;
+  proposalState: ProposalStatus | null;
+}
+
 export type AuditEventType =
   | 'PRODUCT_SEARCHED'
   | 'PRODUCT_INSPECTED'

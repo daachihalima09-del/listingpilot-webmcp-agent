@@ -47,7 +47,9 @@ The repository does **not** contain the commercial Product Truth engine, AI Dete
 
 ### Serverless-safe challenge state
 
-Proposal, approval, publish, and bounded audit state is stored in a compressed, HMAC-signed, `HttpOnly`, `SameSite=Lax` browser session cookie. This deliberately small challenge adapter survives Vercel serverless instance changes without a database or global in-memory singleton. The server validates every decoded field and the content fingerprint before approval or publish. Browser JavaScript cannot read the cookie; tampering fails closed. State is bounded to four proposals, three synthetic published Products, and twelve audit events. This is challenge-demo persistence, not a merchant-data architecture.
+Proposal, approval, publish, and bounded audit state is stored in a compressed, HMAC-signed, `HttpOnly` browser session cookie. Production uses `Secure`, `SameSite=None`, and `Partitioned` so the same challenge session remains available when the HTTPS site runs inside ChatGPT's embedded browser context; local development uses `SameSite=Lax`. Every tool and UI request explicitly includes credentials and disables response caching. This deliberately small challenge adapter survives Vercel serverless instance changes without a database or global in-memory singleton. The server validates every decoded field and the content fingerprint before approval or publish. Browser JavaScript cannot read the cookie; tampering fails closed. State is bounded to four proposals, three synthetic published Products, and twelve audit events. This is challenge-demo persistence, not a merchant-data architecture.
+
+WebMCP registration is static for the document lifetime. After registering, the client checks `document.modelContext.getTools()`, retries any missing intended registration once, and reports the safe `registered/intended` count in the visible header. Session diagnostics expose only missing/valid state, proposal presence, and proposal status—never the cookie, signature, or raw payload.
 
 ## Run locally
 

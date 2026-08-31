@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
+import type { ChallengeSessionDiagnostic } from '@/domain/contracts';
 import { ChallengeError } from './errors';
 import { createChallengeState, type ChallengeState } from './store';
 
@@ -89,23 +90,44 @@ function cookieValue(request: Request): string | undefined {
   return undefined;
 }
 
-export function readChallengeState(request: Request): ChallengeState {
+export interface ChallengeSession {
+  state: ChallengeState;
+  cookieStatus: ChallengeSessionDiagnostic['stateCookie'];
+}
+
+export function readChallengeSession(request: Request): ChallengeSession {
   const value = cookieValue(request);
-  if (!value) return createChallengeState();
+  if (!value) return { state: createChallengeState(), cookieStatus: 'MISSING_NEW_SESSION' };
   try {
-    return decodeState(value);
+    return { state: decodeState(value), cookieStatus: 'VALID' };
   } catch {
-    throw new ChallengeError('INVALID_INPUT', 'Challenge session state is invalid. Reset the demo and try again.', 400);
+    throw new ChallengeError('SESSION_STATE_INVALID', 'Challenge session state is invalid. Reset the demo and try again.', 400);
   }
 }
 
+export function readChallengeState(request: Request): ChallengeState {
+  return readChallengeSession(request).state;
+}
+
+export function challengeSessionDiagnostic(session: ChallengeSession, proposalId?: string): ChallengeSessionDiagnostic {
+  const proposal = proposalId ? session.state.proposals.find((item) => item.proposalId === proposalId) : undefined;
+  return {
+    stateCookie: session.cookieStatus,
+    proposalCount: session.state.proposals.length,
+    proposalFound: proposalId ? Boolean(proposal) : null,
+    proposalState: proposal?.status ?? null,
+  };
+}
+
 export function attachChallengeState(response: NextResponse, state: ChallengeState): NextResponse {
+  const production = process.env.NODE_ENV === 'production';
   response.cookies.set({
     name: CHALLENGE_STATE_COOKIE,
     value: encodeState(state),
     httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    sameSite: production ? 'none' : 'lax',
+    secure: production,
+    partitioned: production,
     path: '/',
     maxAge: COOKIE_MAX_AGE_SECONDS,
   });
@@ -113,7 +135,8 @@ export function attachChallengeState(response: NextResponse, state: ChallengeSta
 }
 
 export function clearChallengeState(response: NextResponse): NextResponse {
-  response.cookies.set({ name: CHALLENGE_STATE_COOKIE, value: '', httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/', maxAge: 0 });
+  const production = process.env.NODE_ENV === 'production';
+  response.cookies.set({ name: CHALLENGE_STATE_COOKIE, value: '', httpOnly: true, sameSite: production ? 'none' : 'lax', secure: production, partitioned: production, path: '/', maxAge: 0 });
   return response;
 }
 

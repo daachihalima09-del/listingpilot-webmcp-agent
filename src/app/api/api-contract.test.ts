@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { POST as prepare } from './proposals/route';
 import { POST as approve } from './proposals/[proposalId]/approve/route';
 import { POST as publish } from './proposals/[proposalId]/publish/route';
+import { GET as getProposal } from './proposals/[proposalId]/route';
+import { GET as getActivity } from './activity/route';
 import { CHALLENGE_STATE_COOKIE } from '@/server/state-cookie.server';
 
 function cookieFrom(response: Response): string {
@@ -28,7 +30,13 @@ describe('proposal API boundary', () => {
     const prepared = await prepare(request('http://localhost/api/proposals', { productId: 'prod_orion_vx65' }));
     const preparedBody = await prepared.clone().json() as { proposal: { proposalId: string } };
     const context = { params: Promise.resolve({ proposalId: preparedBody.proposal.proposalId }) };
-    const denied = await approve(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/approve`, { humanConfirmation: true }, cookieFrom(prepared)), context);
+    const preparedCookie = cookieFrom(prepared);
+    const retrieved = await getProposal(new Request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}`, { headers: { cookie: preparedCookie } }), context);
+    expect(retrieved.status).toBe(200);
+    expect((await retrieved.json()).diagnostic).toMatchObject({ stateCookie: 'VALID', proposalFound: true, proposalState: 'AWAITING_APPROVAL' });
+    const humanView = await getActivity(new Request('http://localhost/api/activity', { headers: { cookie: preparedCookie } }));
+    expect((await humanView.json()).latestProposal.proposalId).toBe(preparedBody.proposal.proposalId);
+    const denied = await approve(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/approve`, { humanConfirmation: true }, preparedCookie), context);
     expect(denied.status).toBe(403);
     const accepted = await approve(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/approve`, { humanConfirmation: true }, cookieFrom(denied), true), context);
     expect(accepted.status).toBe(200);
@@ -46,6 +54,8 @@ describe('proposal API boundary', () => {
     const context = { params: Promise.resolve({ proposalId: body.proposal.proposalId }) };
     const blocked = await publish(request(`http://localhost/api/proposals/${body.proposal.proposalId}/publish`, {}, cookieFrom(prepared)), context);
     expect(blocked.status).toBe(409);
-    expect((await blocked.json()).error.message).toMatch(/Human approval is required/);
+    const blockedBody = await blocked.json();
+    expect(blockedBody.error).toMatchObject({ code: 'HUMAN_APPROVAL_REQUIRED', message: expect.stringMatching(/Human approval is required/) });
+    expect(blockedBody.diagnostic).toMatchObject({ stateCookie: 'VALID', proposalFound: true, proposalState: 'AWAITING_APPROVAL' });
   });
 });

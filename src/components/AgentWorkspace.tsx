@@ -1,14 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import type { AuditEvent, ListingProposal, ProductInspection, ProductSummary, PublishedProduct } from '@/domain/contracts';
+import type { AuditEvent, ChallengeSessionDiagnostic, ListingProposal, ProductInspection, ProductSummary, PublishedProduct } from '@/domain/contracts';
 import { registerListingPilotTools } from '@/webmcp/register-tools';
 import { WEBMCP_RESULT_EVENT, type WebMcpResultEvent } from '@/webmcp/tool-results';
 
 type WebMcpState = 'checking' | 'ready' | 'unsupported' | 'error';
 
 async function jsonRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+  const response = await fetch(input, { ...init, credentials: 'include', cache: 'no-store' });
   const body = await response.json() as T & { error?: { message?: string } };
   if (!response.ok) throw new Error(body.error?.message ?? 'The request could not be completed.');
   return body;
@@ -24,6 +24,8 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   const [proposal, setProposal] = useState<ListingProposal | null>(null);
   const [activity, setActivity] = useState<AuditEvent[]>([]);
   const [webMcpState, setWebMcpState] = useState<WebMcpState>('checking');
+  const [registeredToolCount, setRegisteredToolCount] = useState<number | null>(null);
+  const [sessionDiagnostic, setSessionDiagnostic] = useState<ChallengeSessionDiagnostic | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,16 +35,17 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   }, []);
 
   const loadActivity = useCallback(async () => {
-    const body = await jsonRequest<{ activity: AuditEvent[]; latestProposal: ListingProposal | null; publishedProducts: PublishedProduct[] }>('/api/activity');
+    const body = await jsonRequest<{ activity: AuditEvent[]; latestProposal: ListingProposal | null; publishedProducts: PublishedProduct[]; diagnostic: ChallengeSessionDiagnostic }>('/api/activity');
     setActivity(body.activity);
     setProposal(body.latestProposal);
     body.publishedProducts.forEach(applyPublishedProduct);
+    setSessionDiagnostic(body.diagnostic);
   }, [applyPublishedProduct]);
 
   useEffect(() => {
     const registration = registerListingPilotTools();
     if (!registration.supported) queueMicrotask(() => setWebMcpState('unsupported'));
-    else registration.ready.then(() => setWebMcpState('ready')).catch(() => setWebMcpState('error'));
+    else registration.ready.then((result) => { setRegisteredToolCount(result.registeredTools.length); setWebMcpState(result.registeredTools.length === 4 ? 'ready' : 'error'); }).catch(() => setWebMcpState('error'));
     const handleResult = (event: Event) => {
       const detail = (event as CustomEvent<WebMcpResultEvent>).detail;
       if (detail.kind === 'search') setProducts(detail.products);
@@ -106,7 +109,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
       <div><p className="eyebrow">WEBMCP CHALLENGE EDITION</p><h1>ListingPilot Agent</h1><p className="subtitle">Commerce Copilot · verified truth before action</p></div>
       <div className="agent-status" aria-live="polite">
         <span className={`status-dot status-${webMcpState}`} aria-hidden="true" />
-        <span><strong>{webMcpState === 'ready' ? 'Agent tools ready' : webMcpState === 'unsupported' ? 'WebMCP preview' : webMcpState === 'error' ? 'Tool registration failed' : 'Checking WebMCP'}</strong><small>{webMcpState === 'ready' ? '4 scoped tools · approval stays human-only' : webMcpState === 'unsupported' ? 'Use ChatGPT Browser or enabled Chrome' : 'Secure registration lifecycle'}</small></span>
+        <span><strong>{webMcpState === 'ready' ? 'Agent tools ready' : webMcpState === 'unsupported' ? 'WebMCP preview' : webMcpState === 'error' ? 'Tool registration incomplete' : 'Checking WebMCP'}</strong><small>{webMcpState === 'ready' ? `${registeredToolCount ?? 4}/4 registered · approval stays human-only` : webMcpState === 'unsupported' ? 'Use ChatGPT Browser or enabled Chrome' : webMcpState === 'error' ? `${registeredToolCount ?? 0}/4 registered` : 'Secure registration lifecycle'}</small></span>
       </div>
     </header>
 
@@ -160,6 +163,6 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
         <details className="activity"><summary>Recent bounded activity <span>{activity.length}</span></summary>{activity.map((event) => <div key={event.id}><i /><span><strong>{event.type.replaceAll('_', ' ')}</strong><small>{new Date(event.occurredAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></span></div>)}</details>
       </aside>
     </div>
-    <footer><span>Challenge workspace: Atlas Demo</span><span>Synthetic data only · no OpenAI · no Shopify · no merchant credentials</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
+    <footer><span>Challenge workspace: Atlas Demo</span><span>Session: {sessionDiagnostic?.stateCookie === 'VALID' ? 'valid' : sessionDiagnostic ? 'new' : 'checking'} · Proposal: {sessionDiagnostic?.proposalState?.replaceAll('_', ' ').toLowerCase() ?? 'none'}</span><span>Synthetic data only · no OpenAI · no Shopify</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
   </main>;
 }
