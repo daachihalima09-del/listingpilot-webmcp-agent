@@ -1,28 +1,32 @@
-import type { AuditEvent, ListingProposal } from '@/domain/contracts';
+import type { AuditEvent, ListingProposal, PublishedProduct } from '@/domain/contracts';
 
-interface ChallengeState {
-  proposals: Map<string, ListingProposal>;
+export interface ChallengeState {
+  proposals: ListingProposal[];
+  publishedProducts: PublishedProduct[];
   audit: AuditEvent[];
   sequence: number;
 }
 
-const globalChallenge = globalThis as typeof globalThis & { __listingPilotChallengeState?: ChallengeState };
+export const MAX_STORED_PROPOSALS = 4;
+export const MAX_AUDIT_EVENTS = 12;
 
-function newState(): ChallengeState {
-  return { proposals: new Map(), audit: [], sequence: 0 };
+export function createChallengeState(): ChallengeState {
+  return { proposals: [], publishedProducts: [], audit: [], sequence: 0 };
 }
 
-export function challengeState(): ChallengeState {
-  globalChallenge.__listingPilotChallengeState ??= newState();
-  return globalChallenge.__listingPilotChallengeState;
+export function cloneChallengeState(state: ChallengeState): ChallengeState {
+  return structuredClone(state);
 }
 
-export function nextChallengeId(prefix: 'proposal' | 'audit'): string {
-  const state = challengeState();
+export function nextChallengeId(state: ChallengeState, prefix: 'proposal' | 'audit'): string {
   state.sequence += 1;
   return `${prefix}_${state.sequence.toString().padStart(4, '0')}`;
 }
 
-export function resetChallengeStateForTests(): void {
-  globalChallenge.__listingPilotChallengeState = newState();
+export function storeProposal(state: ChallengeState, proposal: ListingProposal): void {
+  state.proposals = [proposal, ...state.proposals.filter((item) => item.proposalId !== proposal.proposalId)].slice(0, MAX_STORED_PROPOSALS);
+}
+
+export function findStoredProposal(state: ChallengeState, proposalId: string): ListingProposal | undefined {
+  return state.proposals.find((proposal) => proposal.proposalId === proposalId);
 }

@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import type { ListingProposal, ProductInspection, ProductSummary } from '@/domain/contracts';
-import { inspectProductInputSchema, prepareProposalInputSchema, searchProductsInputSchema } from '@/server/schemas';
-import { inspectProductToolSchema, prepareListingToolSchema, searchProductsToolSchema } from './tool-contracts';
+import type { ListingProposal, ProductInspection, ProductSummary, PublishResult } from '@/domain/contracts';
+import { inspectProductInputSchema, prepareProposalInputSchema, publishProposalInputSchema, searchProductsInputSchema } from '@/server/schemas';
+import { inspectProductToolSchema, prepareListingToolSchema, publishApprovedToolSchema, searchProductsToolSchema } from './tool-contracts';
 import { revealWebMcpResult } from './tool-results';
 
 interface ToolDefinition {
@@ -14,6 +14,7 @@ interface ToolDefinition {
 }
 
 let activeController: AbortController | null = null;
+const pendingPublishes = new Map<string, Promise<{ result: PublishResult; proposal: ListingProposal }>>();
 
 async function responseJson<T>(response: Response): Promise<T> {
   const body = await response.json() as T & { error?: { message?: string } };
@@ -57,6 +58,25 @@ export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition
         return { proposal: body.proposal, approvalRequired: true, published: false };
       },
     },
+    {
+      name: 'publish_approved_changes', title: 'Publish approved changes',
+      description: 'Publish the exact stored title and description from an already human-approved proposal to the synthetic demo catalog. This tool cannot approve proposals, cannot alter proposal content, and never calls Shopify.',
+      inputSchema: publishApprovedToolSchema, annotations: { readOnlyHint: false, untrustedContentHint: true },
+      execute: async (untrusted, { signal }) => {
+        const input = publishProposalInputSchema.parse(untrusted);
+        let pending = pendingPublishes.get(input.proposalId);
+        if (!pending) {
+          pending = (async () => responseJson<{ result: PublishResult; proposal: ListingProposal }>(await fetcher(`/api/proposals/${encodeURIComponent(input.proposalId)}/publish`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}), signal,
+          })))();
+          pendingPublishes.set(input.proposalId, pending);
+          void pending.finally(() => pendingPublishes.delete(input.proposalId)).catch(() => undefined);
+        }
+        const body = await pending;
+        revealWebMcpResult({ kind: 'publish', proposal: body.proposal, result: body.result });
+        return body.result;
+      },
+    },
   ];
 }
 
@@ -77,6 +97,6 @@ export function registerListingPilotTools(): { supported: boolean; ready: Promis
 }
 
 export function parseToolInputForTests(toolName: string, value: unknown) {
-  const schemas: Record<string, z.ZodTypeAny> = { search_products: searchProductsInputSchema, inspect_product: inspectProductInputSchema, prepare_listing_improvement: prepareProposalInputSchema };
+  const schemas: Record<string, z.ZodTypeAny> = { search_products: searchProductsInputSchema, inspect_product: inspectProductInputSchema, prepare_listing_improvement: prepareProposalInputSchema, publish_approved_changes: publishProposalInputSchema };
   return schemas[toolName]?.parse(value);
 }

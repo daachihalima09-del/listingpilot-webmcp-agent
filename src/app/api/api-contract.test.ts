@@ -1,26 +1,51 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { POST as prepare } from './proposals/route';
 import { POST as approve } from './proposals/[proposalId]/approve/route';
-import { resetChallengeStateForTests } from '@/server/store';
+import { POST as publish } from './proposals/[proposalId]/publish/route';
+import { CHALLENGE_STATE_COOKIE } from '@/server/state-cookie.server';
 
-beforeEach(resetChallengeStateForTests);
+function cookieFrom(response: Response): string {
+  const raw = response.headers.get('set-cookie');
+  const match = raw?.match(new RegExp(`${CHALLENGE_STATE_COOKIE}=([^;]+)`));
+  if (!match) throw new Error('Challenge state cookie missing.');
+  return `${CHALLENGE_STATE_COOKIE}=${match[1]}`;
+}
+
+function request(url: string, body: object, cookie?: string, human = false): Request {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (cookie) headers.cookie = cookie;
+  if (human) headers['x-listingpilot-human-action'] = 'review-ui';
+  return new Request(url, { method: 'POST', body: JSON.stringify(body), headers });
+}
 
 describe('proposal API boundary', () => {
   it('rejects an unknown Product and unknown input fields', async () => {
-    const unknown = await prepare(new Request('http://localhost/api/proposals', { method: 'POST', body: JSON.stringify({ productId: 'prod_unknown' }), headers: { 'content-type': 'application/json' } }));
-    expect(unknown.status).toBe(404);
-    const injected = await prepare(new Request('http://localhost/api/proposals', { method: 'POST', body: JSON.stringify({ productId: 'prod_orion_vx65', approved: true }), headers: { 'content-type': 'application/json' } }));
-    expect(injected.status).toBe(400);
+    expect((await prepare(request('http://localhost/api/proposals', { productId: 'prod_unknown' }))).status).toBe(404);
+    expect((await prepare(request('http://localhost/api/proposals', { productId: 'prod_orion_vx65', approved: true }))).status).toBe(400);
   });
 
-  it('requires the visible human review boundary for approval', async () => {
-    const prepared = await prepare(new Request('http://localhost/api/proposals', { method: 'POST', body: JSON.stringify({ productId: 'prod_orion_vx65' }), headers: { 'content-type': 'application/json' } }));
-    const { proposal } = await prepared.json() as { proposal: { proposalId: string } };
-    const context = { params: Promise.resolve({ proposalId: proposal.proposalId }) };
-    const denied = await approve(new Request(`http://localhost/api/proposals/${proposal.proposalId}/approve`, { method: 'POST', body: JSON.stringify({ humanConfirmation: true }), headers: { 'content-type': 'application/json' } }), context);
+  it('persists preparation, requires visible human approval, then publishes', async () => {
+    const prepared = await prepare(request('http://localhost/api/proposals', { productId: 'prod_orion_vx65' }));
+    const preparedBody = await prepared.clone().json() as { proposal: { proposalId: string } };
+    const context = { params: Promise.resolve({ proposalId: preparedBody.proposal.proposalId }) };
+    const denied = await approve(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/approve`, { humanConfirmation: true }, cookieFrom(prepared)), context);
     expect(denied.status).toBe(403);
-    const accepted = await approve(new Request(`http://localhost/api/proposals/${proposal.proposalId}/approve`, { method: 'POST', body: JSON.stringify({ humanConfirmation: true }), headers: { 'content-type': 'application/json', 'x-listingpilot-human-action': 'review-ui' } }), context);
+    const accepted = await approve(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/approve`, { humanConfirmation: true }, cookieFrom(denied), true), context);
     expect(accepted.status).toBe(200);
-    expect((await accepted.json()).proposal.status).toBe('APPROVED');
+    expect((await accepted.clone().json()).proposal.status).toBe('APPROVED');
+    const published = await publish(request(`http://localhost/api/proposals/${preparedBody.proposal.proposalId}/publish`, {}, cookieFrom(accepted)), context);
+    expect(published.status).toBe(200);
+    const body = await published.json();
+    expect(body.result).toMatchObject({ status: 'PUBLISHED', demoOnly: true, humanApprovalConfirmed: true });
+    expect(body.proposal.status).toBe('PUBLISHED');
+  });
+
+  it('cannot publish an awaiting-approval proposal', async () => {
+    const prepared = await prepare(request('http://localhost/api/proposals', { productId: 'prod_aeronest_ap5' }));
+    const body = await prepared.clone().json() as { proposal: { proposalId: string } };
+    const context = { params: Promise.resolve({ proposalId: body.proposal.proposalId }) };
+    const blocked = await publish(request(`http://localhost/api/proposals/${body.proposal.proposalId}/publish`, {}, cookieFrom(prepared)), context);
+    expect(blocked.status).toBe(409);
+    expect((await blocked.json()).error.message).toMatch(/Human approval is required/);
   });
 });

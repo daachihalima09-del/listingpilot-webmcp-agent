@@ -17,3 +17,7 @@ export const approveProposalInputSchema = z.object({
   proposalId: z.string().trim().regex(/^proposal_\d{4,}$/),
   humanConfirmation: z.literal(true),
 }).strict();
+
+export const publishProposalInputSchema = z.object({
+  proposalId: z.string().trim().regex(/^proposal_\d{4,}$/),
+}).strict();

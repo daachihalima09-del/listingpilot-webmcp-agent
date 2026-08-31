@@ -3,7 +3,7 @@ export const DEMO_WORKSPACE_ID = 'workspace_demo_atlas';
 export type TruthStatus = 'VERIFIED' | 'CONFLICTING' | 'MISSING';
 export type Confidence = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
 export type HealthStatus = 'GOOD' | 'NEEDS_ATTENTION' | 'AT_RISK';
-export type ProposalStatus = 'AWAITING_APPROVAL' | 'APPROVED';
+export type ProposalStatus = 'AWAITING_APPROVAL' | 'APPROVED' | 'PUBLISHED';
 export type ProposalFocus = 'full_listing' | 'title' | 'description';
 
 export interface EvidenceReference {
@@ -105,13 +105,40 @@ export interface ListingProposal {
   status: ProposalStatus;
   preparedAt: string;
   approvedAt: string | null;
+  publishedAt: string | null;
+  contentFingerprint: string;
+}
+
+export interface PublishedProduct {
+  productId: string;
+  title: string;
+  description: string;
+  lastPublishedProposalId: string;
+  publishedAt: string;
+  revision: number;
+}
+
+export interface PublishResult {
+  proposalId: string;
+  productId: string;
+  status: 'PUBLISHED';
+  publishedFields: readonly ['title', 'description'];
+  humanApprovalConfirmed: true;
+  demoOnly: true;
+  alreadyPublished: boolean;
+  publishedProduct: PublishedProduct;
+  message: string;
 }
 
 export type AuditEventType =
   | 'PRODUCT_SEARCHED'
   | 'PRODUCT_INSPECTED'
   | 'PROPOSAL_PREPARED'
-  | 'PROPOSAL_APPROVED';
+  | 'PROPOSAL_APPROVED'
+  | 'PUBLISH_ATTEMPTED'
+  | 'PUBLISH_BLOCKED'
+  | 'PUBLISH_SUCCEEDED'
+  | 'PUBLISH_DUPLICATE_IGNORED';
 
 export interface AuditEvent {
   id: string;
