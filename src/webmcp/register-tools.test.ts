@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createWebMcpTools, parseToolInputForTests, registerListingPilotTools } from './register-tools';
+import { createWebMcpTools, parseToolInputForTests, registerListingPilotTools, resetWebMcpRegistrationForTests } from './register-tools';
 import { webMcpToolNames } from './tool-contracts';
 
 afterEach(() => {
+  resetWebMcpRegistrationForTests();
   Reflect.deleteProperty(document, 'modelContext');
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -56,7 +58,7 @@ describe('WebMCP contracts', () => {
     expect(remountResult).toEqual(result);
     second.unregister();
     expect(firstSignal?.aborted).toBe(false);
-    expect([...registered.keys()]).toEqual(webMcpToolNames);
+    expect([...registered.keys()].sort()).toEqual([...webMcpToolNames].sort());
   });
 
   it('detects and retries a missing production registration', async () => {
@@ -75,6 +77,110 @@ describe('WebMCP contracts', () => {
     expect(result.registeredTools).toEqual(webMcpToolNames);
     expect(publishAttempts).toBe(2);
     expect(context.registerTool).toHaveBeenCalledTimes(5);
+  });
+
+  it('recovers one disappeared tool without duplicating healthy registrations', async () => {
+    const registered = new Map<string, { name: string }>();
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string }) => { registered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+    const registration = registerListingPilotTools();
+    await registration.ready;
+    expect(context.registerTool).toHaveBeenCalledTimes(4);
+
+    registered.delete('publish_approved_changes');
+    const recovered = await registration.verify();
+    expect(recovered.registeredTools).toEqual(webMcpToolNames);
+    expect(context.registerTool).toHaveBeenCalledTimes(5);
+
+    await registration.verify();
+    await registration.verify();
+    expect(context.registerTool).toHaveBeenCalledTimes(5);
+
+    registered.delete('inspect_product');
+    window.dispatchEvent(new Event('blur'));
+    await vi.waitFor(() => expect(registered.has('inspect_product')).toBe(true));
+    expect(context.registerTool).toHaveBeenCalledTimes(6);
+    expect([...registered.keys()].sort()).toEqual([...webMcpToolNames].sort());
+  });
+
+  it('reattaches all tools when ChatGPT replaces the document model context', async () => {
+    const firstRegistered = new Map<string, { name: string }>();
+    const firstContext = {
+      registerTool: vi.fn(async (tool: { name: string }) => { firstRegistered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...firstRegistered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: firstContext });
+    const registration = registerListingPilotTools();
+    await registration.ready;
+
+    const secondRegistered = new Map<string, { name: string }>();
+    const secondContext = {
+      registerTool: vi.fn(async (tool: { name: string }) => { secondRegistered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...secondRegistered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: secondContext });
+    const reattached = await registration.verify();
+    expect(reattached.registeredTools).toEqual(webMcpToolNames);
+    expect(secondContext.registerTool).toHaveBeenCalledTimes(4);
+    expect([...secondRegistered.keys()]).toEqual(webMcpToolNames);
+  });
+
+  it('keeps publish registered through prepare, blocked publish, approval, and a later turn', async () => {
+    const proposal = { proposalId: 'proposal_0002', workspaceId: 'workspace_atlas_demo', productId: 'prod_orion_vx65', focus: 'full_listing', original: { title: 'Old', description: 'Old' }, proposed: { title: 'Safe', description: 'Safe description' }, reasons: [], factRefs: [], evidenceRefs: [], warnings: [], status: 'AWAITING_APPROVAL', preparedAt: new Date().toISOString(), approvedAt: null, publishedAt: null, contentFingerprint: 'a'.repeat(64) };
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/proposals') return Response.json({ proposal }, { status: 201 });
+      return Response.json({ error: { code: 'HUMAN_APPROVAL_REQUIRED', message: 'Human approval is required before publishing.' } }, { status: 409 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const registered = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { registered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+    const registration = registerListingPilotTools();
+    await registration.ready;
+
+    await registered.get('prepare_listing_improvement')!.execute({ productId: proposal.productId }, { signal: new AbortController().signal });
+    await expect(registered.get('publish_approved_changes')!.execute({ proposalId: proposal.proposalId }, { signal: new AbortController().signal })).rejects.toThrow('HUMAN_APPROVAL_REQUIRED');
+    await Promise.resolve();
+    expect(registered.has('publish_approved_changes')).toBe(true);
+
+    // Human approval is an HTTP/UI transition, not a WebMCP tool. A later
+    // confirmation turn simply verifies the same document registration.
+    await registration.verify();
+    await registration.verify();
+    expect([...registered.keys()]).toEqual(webMcpToolNames);
+    expect(registered.has('publish_approved_changes')).toBe(true);
+    expect([...registered.keys()].some((name) => /^approve/.test(name))).toBe(false);
+  });
+
+  it('does not confuse execution cancellation with registration lifetime', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+      return Response.json({ products: [] });
+    }));
+    const registered = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
+    const registrationSignals: AbortSignal[] = [];
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }, options?: { signal?: AbortSignal }) => {
+        registered.set(tool.name, tool);
+        if (options?.signal) registrationSignals.push(options.signal);
+      }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+    const registration = registerListingPilotTools();
+    await registration.ready;
+    const execution = new AbortController();
+    execution.abort();
+    await expect(registered.get('search_products')!.execute({}, { signal: execution.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    await Promise.resolve();
+    expect(registrationSignals.every((signal) => !signal.aborted)).toBe(true);
+    expect([...registered.keys()]).toEqual(webMcpToolNames);
   });
 
   it('passes the execution AbortSignal to same-origin API requests', async () => {
