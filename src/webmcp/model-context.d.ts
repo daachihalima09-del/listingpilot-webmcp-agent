@@ -1,0 +1,14 @@
+interface WebMcpTool {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: object;
+  annotations?: { readOnlyHint?: boolean; untrustedContentHint?: boolean };
+  execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown>;
+}
+
+interface Document {
+  readonly modelContext?: {
+    registerTool(tool: WebMcpTool, options?: { signal?: AbortSignal; exposedTo?: string[] }): Promise<undefined>;
+  };
+}
