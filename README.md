@@ -45,11 +45,11 @@ flowchart LR
 
 The repository does **not** contain the commercial Product Truth engine, AI Detective internals, Catalog Health algorithms, generation prompts, merchant preferences, production Prisma schema, Shopify tokens/OAuth, Safe Publishing implementation, merchant data, or private source imports.
 
-### Serverless-safe challenge state
+### Durable challenge state
 
-Proposal, approval, publish, and bounded audit state is stored in a compressed, HMAC-signed, `HttpOnly` browser session cookie. Production uses `Secure`, `SameSite=None`, and `Partitioned` so the same challenge session remains available when the HTTPS site runs inside ChatGPT's embedded browser context; local development uses `SameSite=Lax`. Every tool and UI request explicitly includes credentials and disables response caching. This deliberately small challenge adapter survives Vercel serverless instance changes without a database or global in-memory singleton. The server validates every decoded field and the content fingerprint before approval or publish. Browser JavaScript cannot read the cookie; tampering fails closed. State is bounded to four proposals, three synthetic published Products, and twelve audit events. This is challenge-demo persistence, not a merchant-data architecture.
+Proposal, approval, publish, and bounded audit state is stored server-side in Upstash Redis. The browser stores only an opaque, HMAC-authenticated 256-bit session pointer in origin-scoped storage and sends it in a same-origin request header. The server stores only a SHA-256 hash of that bearer value, binds the record to the challenge workspace, validates every field, and expires the record after 24 hours. Mutations use an atomic compare-and-set revision, so a response based on an older snapshot cannot overwrite a newer `APPROVED` or `PUBLISHED` record. State remains bounded to four proposals, three synthetic published Products, and twelve audit events. Production never falls back to process memory; local development and tests do. This is challenge-demo persistence, not a merchant-data architecture.
 
-WebMCP registration is static for the document lifetime. After registering, the client checks `document.modelContext.getTools()`, retries any missing intended registration once, and reports the safe `registered/intended` count in the visible header. Session diagnostics expose only missing/valid state, proposal presence, and proposal status—never the cookie, signature, or raw payload.
+WebMCP tools are registered once for the current document-associated `ModelContext` with one long-lived registration `AbortSignal`. The app verifies the four intended tools through `getTools()` and reconciles a missing registration only when the standard `toolchange` event fires. It does not poll focus, visibility, or agent turns. A newly loaded document registers its own four tools. Session diagnostics expose only durable/new state, revision, proposal presence, and proposal status—never the bearer token, server record, or secrets.
 
 ## Run locally
 
@@ -60,7 +60,7 @@ npm install
 npm run dev
 ```
 
-Set `CHALLENGE_STATE_SECRET` in `.env.local` and in Vercel to a random value of at least 32 characters. Local development and tests have a non-production fallback; production intentionally returns a safe configuration error when the secret is absent. Open `http://localhost:3000`. The app makes no OpenAI or Shopify calls.
+Set `CHALLENGE_STATE_SECRET` in `.env.local` and in Vercel to a random value of at least 32 characters. Production also requires `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`; it intentionally returns a safe configuration error instead of using volatile memory when they are absent. Local development and tests use bounded in-memory state. Open `http://localhost:3000`. The app makes no OpenAI or Shopify calls.
 
 Quality gates:
 
@@ -79,10 +79,12 @@ npm run build
 2. Open the running app in ChatGPT’s built-in browser. A deployed HTTPS URL is preferred; `localhost` is a secure-context exception for local development.
 3. Select the site-tools arrow in the address bar and confirm the four tools above appear.
 4. Ask: “Search products that need improvement. Inspect the weakest result and prepare a full listing improvement.”
-5. Confirm the proposal appears visibly and remains `AWAITING APPROVAL`; asking the agent to publish now must be blocked.
-6. Use the visible **Approve proposal** button yourself. Confirm the UI says it is waiting for the agent.
-7. Ask the agent to publish the approved proposal. Confirm the proposal becomes `PUBLISHED`, the visible catalog updates, and the audit trail records attempt and success.
-8. Ask it to publish the same proposal again. Confirm the revision does not increase and the audit reports the duplicate was ignored.
+5. Confirm the proposal appears visibly as `AWAITING APPROVAL`, refresh the same canonical deployment URL, and confirm it remains awaiting approval. Asking the agent to publish now must be blocked.
+6. Use the visible **Approve proposal** button yourself. Refresh and confirm both the card and footer remain `APPROVED`.
+7. Keep this ListingPilot page selected as the current site-tools page, then ask the agent to publish the approved proposal. Confirm the proposal becomes `PUBLISHED`, the visible catalog updates, and the audit trail records attempt and success.
+8. Refresh and confirm it remains `PUBLISHED`. Ask the agent to publish the same proposal again; confirm the Product revision does not increase and the audit reports the duplicate was ignored.
+
+Site tools are associated with the webpage that provides them. If ChatGPT disconnects or changes its current site-tools page during its own confirmation turn, page JavaScript cannot attach that page's tools to the agent session. Re-select the same ListingPilot page/site tools; the four page tools and durable proposal state remain available. Use one canonical Vercel hostname because the opaque browser session pointer is intentionally origin-scoped.
 
 ### Google Chrome experimental testing
 
@@ -103,7 +105,7 @@ Verified on 30 August 2026:
 - [Devpost submission requirements](https://webmcp.devpost.com/)
 - [OpenAI site-tools help](https://help.openai.com/en/articles/20001423-using-site-tools-in-the-chatgpt-desktop-app)
 
-The API is experimental. The implementation feature-detects `document.modelContext`, uses strict JSON Schema, passes execution cancellation signals to `fetch`, and unregisters all tools through one `AbortController`.
+The API is experimental. The implementation feature-detects `document.modelContext`, uses strict JSON Schema, passes execution cancellation signals to `fetch`, and keeps registration cancellation separate from individual execution cancellation.
 
 ## License
 

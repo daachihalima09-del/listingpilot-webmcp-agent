@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AuditEvent, ChallengeSessionDiagnostic, ListingProposal, ProductInspection, ProductSummary, PublishedProduct } from '@/domain/contracts';
 import { registerListingPilotTools } from '@/webmcp/register-tools';
 import { WEBMCP_RESULT_EVENT, type WebMcpResultEvent } from '@/webmcp/tool-results';
+import { challengeFetch, clearChallengeSession } from '@/session/challenge-fetch';
 
 type WebMcpState = 'checking' | 'ready' | 'unsupported' | 'error';
 
@@ -20,7 +21,7 @@ function keepNewestProposal(current: ListingProposal | null, incoming: ListingPr
 }
 
 async function jsonRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, { ...init, credentials: 'include', cache: 'no-store' });
+  const response = await challengeFetch(fetch, input, init);
   const body = await response.json() as T & { error?: { message?: string } };
   if (!response.ok) throw new Error(body.error?.message ?? 'The request could not be completed.');
   return body;
@@ -114,6 +115,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
     setBusy('reset'); setError(null);
     try {
       await jsonRequest<{ reset: true }>('/api/demo/reset', { method: 'POST' });
+      clearChallengeSession();
       window.location.reload();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Demo reset failed.'); setBusy(null); }
   }
@@ -180,6 +182,6 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
         <details className="activity"><summary>Recent bounded activity <span>{activity.length}</span></summary>{activity.map((event) => <div key={event.id}><i /><span><strong>{event.type.replaceAll('_', ' ')}</strong><small>{new Date(event.occurredAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></span></div>)}</details>
       </aside>
     </div>
-    <footer><span>Challenge workspace: Atlas Demo</span><span>Session: {sessionDiagnostic?.stateCookie === 'VALID' ? 'valid' : sessionDiagnostic ? 'new' : 'checking'} · Proposal: {(proposal?.status ?? sessionDiagnostic?.proposalState)?.replaceAll('_', ' ').toLowerCase() ?? 'none'}</span><span>Synthetic data only · no OpenAI · no Shopify</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
+    <footer><span>Challenge workspace: Atlas Demo</span><span>Session: {sessionDiagnostic?.sessionState === 'DURABLE' ? 'durable' : sessionDiagnostic ? 'new' : 'checking'} · Proposal: {(proposal?.status ?? sessionDiagnostic?.proposalState)?.replaceAll('_', ' ').toLowerCase() ?? 'none'}</span><span>Synthetic data only · no OpenAI · no Shopify</span><button className="reset-demo" onClick={() => void resetDemo()} disabled={busy !== null}>{busy === 'reset' ? 'Resetting…' : 'Reset demo'}</button></footer>
   </main>;
 }

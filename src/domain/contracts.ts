@@ -131,7 +131,8 @@ export interface PublishResult {
 }
 
 export interface ChallengeSessionDiagnostic {
-  stateCookie: 'MISSING_NEW_SESSION' | 'VALID';
+  sessionState: 'NEW' | 'DURABLE';
+  revision: number;
   proposalCount: number;
   proposalFound: boolean | null;
   proposalState: ProposalStatus | null;

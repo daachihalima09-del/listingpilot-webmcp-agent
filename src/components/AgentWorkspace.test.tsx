@@ -13,6 +13,7 @@ vi.mock('@/webmcp/register-tools', () => ({
 
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -23,7 +24,7 @@ describe('agent workspace proposal lifecycle', () => {
     const inspection = inspectProduct(state, DEMO_WORKSPACE_ID, products[0].productId);
     const prepared = prepareListingImprovement(state, DEMO_WORKSPACE_ID, products[0].productId, 'full_listing');
     const approved: ListingProposal = { ...prepared, status: 'APPROVED', approvedAt: new Date().toISOString() };
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ activity: [], latestProposal: approved, publishedProducts: [], diagnostic: { stateCookie: 'VALID', proposalCount: 1, proposalFound: true, proposalState: 'APPROVED' } }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ activity: [], latestProposal: approved, publishedProducts: [], diagnostic: { sessionState: 'DURABLE', revision: 2, proposalCount: 1, proposalFound: true, proposalState: 'APPROVED' } }), { status: 200, headers: { 'content-type': 'application/json' } })));
 
     render(<AgentWorkspace initialProducts={products} initialInspection={inspection} />);
     await waitFor(() => expect(screen.getByText(/Waiting for the agent to call/)).toBeTruthy());
@@ -52,7 +53,7 @@ describe('agent workspace proposal lifecycle', () => {
     const inspection = inspectProduct(state, DEMO_WORKSPACE_ID, products[0].productId);
     const awaiting = prepareListingImprovement(state, DEMO_WORKSPACE_ID, products[0].productId, 'full_listing');
     const approved: ListingProposal = { ...awaiting, status: 'APPROVED', approvedAt: new Date().toISOString() };
-    const diagnostic = (proposalState: ListingProposal['status']) => ({ stateCookie: 'VALID' as const, proposalCount: 1, proposalFound: true, proposalState });
+    const diagnostic = (proposalState: ListingProposal['status']) => ({ sessionState: 'DURABLE' as const, revision: 2, proposalCount: 1, proposalFound: true, proposalState });
     const activityBody = (latestProposal: ListingProposal) => ({ activity: [], latestProposal, publishedProducts: [], diagnostic: diagnostic(latestProposal.status) });
     let resolveStale!: (response: Response) => void;
     const staleResponse = new Promise<Response>((resolve) => { resolveStale = resolve; });

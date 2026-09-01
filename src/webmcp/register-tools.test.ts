@@ -6,6 +6,7 @@ import { webMcpToolNames } from './tool-contracts';
 afterEach(() => {
   resetWebMcpRegistrationForTests();
   Reflect.deleteProperty(document, 'modelContext');
+  window.localStorage.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -81,9 +82,12 @@ describe('WebMCP contracts', () => {
 
   it('recovers one disappeared tool without duplicating healthy registrations', async () => {
     const registered = new Map<string, { name: string }>();
+    let toolChange: (() => void) | undefined;
     const context = {
       registerTool: vi.fn(async (tool: { name: string }) => { registered.set(tool.name, tool); }),
       getTools: vi.fn(async () => [...registered.values()]),
+      addEventListener: vi.fn((_type: string, listener: () => void) => { toolChange = listener; }),
+      removeEventListener: vi.fn(),
     };
     Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
     const registration = registerListingPilotTools();
@@ -100,21 +104,21 @@ describe('WebMCP contracts', () => {
     expect(context.registerTool).toHaveBeenCalledTimes(5);
 
     registered.delete('inspect_product');
-    window.dispatchEvent(new Event('blur'));
+    toolChange?.();
     await vi.waitFor(() => expect(registered.has('inspect_product')).toBe(true));
     expect(context.registerTool).toHaveBeenCalledTimes(6);
     expect([...registered.keys()].sort()).toEqual([...webMcpToolNames].sort());
   });
 
-  it('reattaches all tools when ChatGPT replaces the document model context', async () => {
+  it('registers a fresh document after reload without depending on the old context', async () => {
     const firstRegistered = new Map<string, { name: string }>();
     const firstContext = {
       registerTool: vi.fn(async (tool: { name: string }) => { firstRegistered.set(tool.name, tool); }),
       getTools: vi.fn(async () => [...firstRegistered.values()]),
     };
     Object.defineProperty(document, 'modelContext', { configurable: true, value: firstContext });
-    const registration = registerListingPilotTools();
-    await registration.ready;
+    await registerListingPilotTools().ready;
+    resetWebMcpRegistrationForTests();
 
     const secondRegistered = new Map<string, { name: string }>();
     const secondContext = {
@@ -122,7 +126,7 @@ describe('WebMCP contracts', () => {
       getTools: vi.fn(async () => [...secondRegistered.values()]),
     };
     Object.defineProperty(document, 'modelContext', { configurable: true, value: secondContext });
-    const reattached = await registration.verify();
+    const reattached = await registerListingPilotTools().ready;
     expect(reattached.registeredTools).toEqual(webMcpToolNames);
     expect(secondContext.registerTool).toHaveBeenCalledTimes(4);
     expect([...secondRegistered.keys()]).toEqual(webMcpToolNames);
@@ -184,11 +188,17 @@ describe('WebMCP contracts', () => {
   });
 
   it('passes the execution AbortSignal to same-origin API requests', async () => {
-    const fetcher = vi.fn(async () => new Response(JSON.stringify({ products: [] }), { status: 200, headers: { 'content-type': 'application/json' } }));
-    const tool = createWebMcpTools(fetcher as unknown as typeof fetch)[0];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      void input;
+      void init;
+      return new Response(JSON.stringify({ products: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    const tool = createWebMcpTools(fetcher as typeof fetch)[0];
     const controller = new AbortController();
     await tool.execute({}, { signal: controller.signal });
-    expect(fetcher).toHaveBeenCalledWith('/api/products', { signal: controller.signal, credentials: 'include', cache: 'no-store' });
+    const [, init] = fetcher.mock.calls[0];
+    expect(init).toMatchObject({ signal: controller.signal, credentials: 'include', cache: 'no-store' });
+    expect(init?.headers).toBeInstanceOf(Headers);
   });
 
   it('coalesces rapid duplicate publish calls into one API request', async () => {

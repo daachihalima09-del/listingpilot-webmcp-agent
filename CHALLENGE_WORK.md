@@ -23,3 +23,12 @@
 - Made the four-tool registration stable for the document lifetime and added post-registration discovery verification with one bounded missing-tool retry.
 - Added safe registration/session diagnostics and the stable `HUMAN_APPROVAL_REQUIRED` blocked-publish error code.
 - Preserved the separate visible human approval transition and the exact-content, synthetic-only publisher.
+
+## Day 2.4 — durable approval and standards-based tool lifecycle
+
+- Replaced the embedded-browser cookie snapshot with bounded Upstash-backed challenge sessions. The browser holds only a signed opaque pointer; production state is server-authoritative and expires after 24 hours.
+- Added atomic revision compare-and-set writes so stale concurrent requests cannot regress `APPROVED` or `PUBLISHED` state.
+- Added independent reload/request coverage for awaiting, approved, published, idempotent, exact-content, and isolation behavior.
+- Replaced focus/visibility/interval registration repairs with one registration per document `ModelContext`, `getTools()` verification, and `toolchange` reconciliation.
+- Documented the platform boundary: the page can expose tools for its document, but cannot force ChatGPT to keep that page attached as the current site-tools source across a separate confirmation turn.
+- Kept exactly four WebMCP tools, with no agent-callable approval transition, and introduced no OpenAI or Shopify integration.

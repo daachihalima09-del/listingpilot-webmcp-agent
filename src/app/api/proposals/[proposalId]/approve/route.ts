@@ -4,22 +4,21 @@ import { approveProposalFromHuman } from '@/server/challenge-service';
 import { ChallengeError } from '@/server/errors';
 import { challengeErrorResponse } from '@/server/http';
 import { approveProposalInputSchema } from '@/server/schemas';
-import { attachChallengeState, challengeSessionDiagnostic, readChallengeSession } from '@/server/state-cookie.server';
+import { attachChallengeSession, challengeSessionDiagnostic, commitChallengeSession, readChallengeSession } from '@/server/durable-session.server';
 
 export async function POST(request: Request, context: { params: Promise<{ proposalId: string }> }) {
-  let state;
   try {
-    const session = readChallengeSession(request);
-    state = session.state;
+    const session = await readChallengeSession(request, DEMO_WORKSPACE_ID);
     if (request.headers.get('x-listingpilot-human-action') !== 'review-ui') {
       throw new ChallengeError('FORBIDDEN', 'Approval is available only from the visible human review interface.', 403);
     }
     const params = await context.params;
     const body = await request.json();
     const input = approveProposalInputSchema.parse({ ...body, proposalId: params.proposalId });
-    const proposal = approveProposalFromHuman(state, DEMO_WORKSPACE_ID, input.proposalId);
-    return attachChallengeState(NextResponse.json({ proposal, diagnostic: challengeSessionDiagnostic(session, input.proposalId) }), state);
+    const proposal = approveProposalFromHuman(session.state, DEMO_WORKSPACE_ID, input.proposalId);
+    await commitChallengeSession(session, DEMO_WORKSPACE_ID);
+    return attachChallengeSession(NextResponse.json({ proposal, diagnostic: challengeSessionDiagnostic(session, input.proposalId) }), session);
   } catch (error) {
-    return challengeErrorResponse(error, state);
+    return challengeErrorResponse(error);
   }
 }

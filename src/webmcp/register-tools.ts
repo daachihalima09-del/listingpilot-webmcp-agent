@@ -3,6 +3,7 @@ import type { ListingProposal, ProductInspection, ProductSummary, PublishResult 
 import { inspectProductInputSchema, prepareProposalInputSchema, publishProposalInputSchema, searchProductsInputSchema } from '@/server/schemas';
 import { inspectProductToolSchema, prepareListingToolSchema, publishApprovedToolSchema, searchProductsToolSchema } from './tool-contracts';
 import { revealWebMcpResult } from './tool-results';
+import { challengeFetch } from '@/session/challenge-fetch';
 
 interface ToolDefinition {
   name: string;
@@ -22,18 +23,13 @@ export interface WebMcpRegistrationResult {
 interface ActiveRegistration {
   context: NonNullable<Document['modelContext']>;
   controller: AbortController;
-  definitions: ToolDefinition[];
-  intendedTools: string[];
   ready: Promise<WebMcpRegistrationResult>;
-  verification: Promise<WebMcpRegistrationResult> | null;
-  initializedWithoutDiscovery: boolean;
+  reconcile: () => Promise<WebMcpRegistrationResult>;
+  handleToolChange: () => void;
 }
 
 let activeRegistration: ActiveRegistration | null = null;
-let verificationInterval: number | null = null;
-let verificationTimeout: number | null = null;
 const pendingPublishes = new Map<string, Promise<{ result: PublishResult; proposal: ListingProposal }>>();
-const REGISTRATION_VERIFICATION_INTERVAL_MS = 5_000;
 
 async function responseJson<T>(response: Response): Promise<T> {
   const body = await response.json() as T & { error?: { message?: string } };
@@ -45,7 +41,7 @@ async function responseJson<T>(response: Response): Promise<T> {
 }
 
 function toolFetch(fetcher: typeof fetch, input: RequestInfo | URL, init: RequestInit = {}) {
-  return fetcher(input, { ...init, credentials: 'include', cache: 'no-store' });
+  return challengeFetch(fetcher, input, init);
 }
 
 export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition[] {
@@ -106,124 +102,57 @@ export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition
   ];
 }
 
-function verificationDefinitions(): ToolDefinition[] {
-  return createWebMcpTools().map((tool) => ({
-    ...tool,
-    execute: async (input, options) => {
-      try {
-        return await tool.execute(input, options);
-      } finally {
-        // Invocation cancellation belongs only to this execution. Registration
-        // has its own document-lifetime signal and is verified after every call.
-        scheduleRegistrationVerification();
-      }
-    },
-  }));
-}
-
-async function verifyRegistration(registration: ActiveRegistration): Promise<WebMcpRegistrationResult> {
-  if (registration.verification) return registration.verification;
-  registration.verification = (async () => {
-    const { context, controller, definitions, intendedTools } = registration;
-    if (controller.signal.aborted) throw new Error('WebMCP registration context was replaced.');
-    if (typeof context.getTools !== 'function') {
-      if (!registration.initializedWithoutDiscovery) {
-        await Promise.all(definitions.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-        registration.initializedWithoutDiscovery = true;
-      }
-      return { intendedTools, registeredTools: intendedTools, verified: false };
-    }
-    let registeredTools = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-    const missing = definitions.filter((tool) => !registeredTools.includes(tool.name));
-    if (missing.length > 0) {
-      await Promise.all(missing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-      registeredTools = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-      const stillMissing = definitions.filter((tool) => !registeredTools.includes(tool.name));
-      if (stillMissing.length > 0) {
-        await Promise.all(stillMissing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-        registeredTools = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-      }
-    }
-    const complete = intendedTools.every((name) => registeredTools.includes(name));
-    if (!complete) throw new Error(`WebMCP registration incomplete (${registeredTools.length}/${intendedTools.length}).`);
-    return { intendedTools, registeredTools, verified: true };
-  })();
-  try {
-    return await registration.verification;
-  } finally {
-    registration.verification = null;
-  }
-}
-
 function createRegistration(context: NonNullable<Document['modelContext']>): ActiveRegistration {
   const controller = new AbortController();
-  const definitions = verificationDefinitions();
+  const definitions = createWebMcpTools();
   const intendedTools = definitions.map((tool) => tool.name);
-  const registration: ActiveRegistration = { context, controller, definitions, intendedTools, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), verification: null, initializedWithoutDiscovery: false };
-  registration.ready = verifyRegistration(registration);
+  let reconciliation: Promise<WebMcpRegistrationResult> | null = null;
+  const reconcile = async (): Promise<WebMcpRegistrationResult> => {
+    if (reconciliation) return reconciliation;
+    reconciliation = (async () => {
+      const discovered = await context.getTools();
+      const registeredNames = discovered.map((tool) => tool.name);
+      const missing = definitions.filter((tool) => !registeredNames.includes(tool.name));
+      if (missing.length > 0) await Promise.all(missing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
+      const verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+      if (!intendedTools.every((name) => verifiedNames.includes(name))) throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
+      return { intendedTools, registeredTools: verifiedNames, verified: true };
+    })();
+    try { return await reconciliation; } finally { reconciliation = null; }
+  };
+  const ready = (async () => {
+    await Promise.all(definitions.map((tool) => context.registerTool(tool, { signal: controller.signal })));
+    return reconcile();
+  })();
+  const handleToolChange = () => { void reconcile().catch(() => undefined); };
+  const registration: ActiveRegistration = { context, controller, ready, reconcile, handleToolChange };
+  void ready.then(() => context.addEventListener?.('toolchange', handleToolChange)).catch(() => undefined);
   return registration;
 }
 
-function ensureActiveRegistration(): ActiveRegistration | null {
-  if (typeof document === 'undefined' || !document.modelContext) return null;
-  const context = document.modelContext;
-  if (activeRegistration?.context === context && !activeRegistration.controller.signal.aborted) return activeRegistration;
-  activeRegistration?.controller.abort();
-  activeRegistration = createRegistration(context);
-  const controller = activeRegistration.controller;
-  const ready = activeRegistration.ready;
-  void ready.catch(() => {
-    if (activeRegistration?.controller === controller) activeRegistration = null;
-    controller.abort();
-  });
-  return activeRegistration;
-}
-
-function requestRegistrationVerification(): void {
-  void verifyListingPilotTools().catch(() => undefined);
-}
-
-function scheduleRegistrationVerification(): void {
-  if (verificationTimeout !== null) return;
-  verificationTimeout = window.setTimeout(() => {
-    verificationTimeout = null;
-    requestRegistrationVerification();
-  }, 0);
-}
-
-function startRegistrationMonitor(): void {
-  if (typeof window === 'undefined' || verificationInterval !== null) return;
-  verificationInterval = window.setInterval(requestRegistrationVerification, REGISTRATION_VERIFICATION_INTERVAL_MS);
-  window.addEventListener('focus', requestRegistrationVerification);
-  window.addEventListener('blur', requestRegistrationVerification);
-  window.addEventListener('pageshow', requestRegistrationVerification);
-  document.addEventListener('visibilitychange', requestRegistrationVerification);
-}
-
 export async function verifyListingPilotTools(): Promise<WebMcpRegistrationResult> {
-  const registration = ensureActiveRegistration();
-  if (!registration) return { intendedTools: [], registeredTools: [], verified: false };
-  return verifyRegistration(registration);
+  if (typeof document === 'undefined' || !activeRegistration || activeRegistration.context !== document.modelContext) return { intendedTools: [], registeredTools: [], verified: false };
+  return activeRegistration.reconcile();
 }
 
 export function registerListingPilotTools(): { supported: boolean; ready: Promise<WebMcpRegistrationResult>; verify: () => Promise<WebMcpRegistrationResult>; unregister: () => void } {
-  const registration = ensureActiveRegistration();
-  if (!registration) return { supported: false, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), verify: verifyListingPilotTools, unregister: () => undefined };
-  startRegistrationMonitor();
-  return { supported: true, ready: registration.ready, verify: verifyListingPilotTools, unregister: () => undefined };
+  if (typeof document === 'undefined' || !document.modelContext) return { supported: false, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), verify: verifyListingPilotTools, unregister: () => undefined };
+  if (!activeRegistration || activeRegistration.context !== document.modelContext) {
+    if (activeRegistration) {
+      activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
+      activeRegistration.controller.abort();
+    }
+    activeRegistration = createRegistration(document.modelContext);
+  }
+  return { supported: true, ready: activeRegistration.ready, verify: verifyListingPilotTools, unregister: () => undefined };
 }
 
 export function resetWebMcpRegistrationForTests(): void {
-  activeRegistration?.controller.abort();
+  if (activeRegistration) {
+    activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
+    activeRegistration.controller.abort();
+  }
   activeRegistration = null;
-  if (typeof window !== 'undefined' && verificationInterval !== null) window.clearInterval(verificationInterval);
-  if (typeof window !== 'undefined' && verificationTimeout !== null) window.clearTimeout(verificationTimeout);
-  verificationInterval = null;
-  verificationTimeout = null;
-  if (typeof window !== 'undefined') window.removeEventListener('focus', requestRegistrationVerification);
-  if (typeof window !== 'undefined') window.removeEventListener('blur', requestRegistrationVerification);
-  if (typeof window !== 'undefined') window.removeEventListener('pageshow', requestRegistrationVerification);
-  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', requestRegistrationVerification);
   pendingPublishes.clear();
 }
 
