@@ -32,9 +32,12 @@ interface ActiveRegistration {
   ready: Promise<WebMcpRegistrationResult>;
   reconcile: () => Promise<WebMcpRegistrationResult>;
   handleToolChange: () => void;
+  retire: () => void;
+  retired: boolean;
 }
 
 let activeRegistration: ActiveRegistration | null = null;
+let registrationBootstrap: Promise<ActiveRegistration> | null = null;
 type PublishApiResponse =
   | { ok: true; body: { result: PublishResult; proposal: ListingProposal } }
   | { ok: false; code: string; message: string; reference: string | null };
@@ -200,34 +203,56 @@ export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition
 function createRegistration(context: NonNullable<Document['modelContext']>): ActiveRegistration {
   const definitions = createWebMcpTools();
   const intendedTools = definitions.map((tool) => tool.name);
+  const ownedTools = new Set<string>();
+  const registrationController = new AbortController();
   recordDevelopmentDiagnostic(definitions, [], false);
   let reconciliation: Promise<WebMcpRegistrationResult> | null = null;
+  let retired = false;
+  const retryDelays = [0, 20, 50, 100, 200] as const;
+  const wait = (milliseconds: number) => milliseconds === 0
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
   const reconcile = async (): Promise<WebMcpRegistrationResult> => {
     if (reconciliation) return reconciliation;
     reconciliation = (async () => {
       try {
         let verifiedNames: string[] = [];
-        for (let attempt = 0; attempt < 3; attempt += 1) {
+        let lastRegistrationError: unknown;
+        for (const retryDelay of retryDelays) {
+          if (retired || registrationController.signal.aborted) throw new DOMException('The document registration was retired.', 'AbortError');
+          await wait(retryDelay);
           const discoveredNames = (await context.getTools()).map((tool) => tool.name);
-          const missing = definitions.filter((tool) => !discoveredNames.includes(tool.name));
+          const missing = definitions.filter((tool) => !ownedTools.has(tool.name));
           for (const tool of missing) {
+            // A same-name tool can briefly belong to the previous document while
+            // an embedded-browser refresh is handing ownership to this document.
+            // It is visible, but it is not this document's callable handler.
+            if (discoveredNames.includes(tool.name)) continue;
             try {
-              await context.registerTool(tool);
+              await context.registerTool(tool, { signal: registrationController.signal });
+              ownedTools.add(tool.name);
             } catch (error) {
-              const concurrentlyRegistered = (await context.getTools()).some((registered) => registered.name === tool.name);
-              if (!concurrentlyRegistered) throw error;
+              lastRegistrationError = error;
             }
           }
-          verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-          if (intendedTools.every((name) => verifiedNames.includes(name))) break;
+          const visibleNames = (await context.getTools()).map((tool) => tool.name);
+          verifiedNames = intendedTools.filter((name) => visibleNames.includes(name));
+          for (const ownedName of ownedTools) {
+            if (!visibleNames.includes(ownedName)) ownedTools.delete(ownedName);
+          }
+          if (intendedTools.every((name) => ownedTools.has(name) && verifiedNames.includes(name))) {
+            const result = { intendedTools, registeredTools: verifiedNames, verified: true };
+            recordDevelopmentDiagnostic(definitions, verifiedNames, true);
+            return result;
+          }
         }
-        if (!intendedTools.every((name) => verifiedNames.includes(name))) throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
-        recordDevelopmentDiagnostic(definitions, verifiedNames, true);
-        return { intendedTools, registeredTools: verifiedNames, verified: true };
+        if (lastRegistrationError) throw lastRegistrationError;
+        throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
       } catch (error) {
         let registeredNames: string[] = [];
         try {
-          registeredNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+          const visibleNames = (await context.getTools()).map((tool) => tool.name);
+          registeredNames = intendedTools.filter((name) => visibleNames.includes(name));
         } catch {
           // Preserve the authoritative registration error.
         }
@@ -237,34 +262,63 @@ function createRegistration(context: NonNullable<Document['modelContext']>): Act
     })();
     try { return await reconciliation; } finally { reconciliation = null; }
   };
-  const ready = reconcile();
   const handleToolChange = () => { void reconcile().catch(() => undefined); };
-  const registration: ActiveRegistration = { context, ready, reconcile, handleToolChange };
-  void ready.then(() => context.addEventListener?.('toolchange', handleToolChange)).catch(() => undefined);
+  const retire = () => {
+    if (retired) return;
+    retired = true;
+    registration.retired = true;
+    context.removeEventListener?.('toolchange', handleToolChange);
+    window.removeEventListener('pagehide', retire);
+    registrationController.abort();
+    if (activeRegistration === registration) activeRegistration = null;
+  };
+  context.addEventListener?.('toolchange', handleToolChange);
+  window.addEventListener('pagehide', retire, { once: true });
+  const ready = reconcile();
+  const registration: ActiveRegistration = { context, ready, reconcile, handleToolChange, retire, retired: false };
   return registration;
 }
 
+async function acquireActiveRegistration(): Promise<ActiveRegistration> {
+  if (registrationBootstrap) return registrationBootstrap;
+  registrationBootstrap = (async () => {
+    const readinessDelays = [0, 25, 50, 100, 200, 400, 600, 800, 1_000] as const;
+    for (const retryDelay of readinessDelays) {
+      if (retryDelay > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay));
+      const context = document.modelContext;
+      if (!context) continue;
+      if (activeRegistration?.context === context && !activeRegistration.retired) return activeRegistration;
+      activeRegistration?.retire();
+      activeRegistration = createRegistration(context);
+      return activeRegistration;
+    }
+    throw new DOMException('WebMCP is not available in this browser.', 'NotSupportedError');
+  })();
+  try {
+    return await registrationBootstrap;
+  } finally {
+    registrationBootstrap = null;
+  }
+}
+
 export async function verifyListingPilotTools(): Promise<WebMcpRegistrationResult> {
-  if (typeof document === 'undefined' || !activeRegistration || activeRegistration.context !== document.modelContext) return { intendedTools: [], registeredTools: [], verified: false };
-  return activeRegistration.reconcile();
+  if (typeof document === 'undefined') return { intendedTools: [], registeredTools: [], verified: false };
+  const registration = await acquireActiveRegistration();
+  return registration.reconcile();
 }
 
 export function registerListingPilotTools(): { supported: boolean; ready: Promise<WebMcpRegistrationResult>; verify: () => Promise<WebMcpRegistrationResult>; unregister: () => void } {
-  if (typeof document === 'undefined' || !document.modelContext) return { supported: false, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), verify: verifyListingPilotTools, unregister: () => undefined };
-  if (!activeRegistration || activeRegistration.context !== document.modelContext) {
-    if (activeRegistration) {
-      activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
-    }
-    activeRegistration = createRegistration(document.modelContext);
-  }
-  return { supported: true, ready: activeRegistration.ready, verify: verifyListingPilotTools, unregister: () => undefined };
+  if (typeof document === 'undefined') return { supported: false, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), verify: verifyListingPilotTools, unregister: () => undefined };
+  const ready = acquireActiveRegistration().then((registration) => registration.ready);
+  // React unmounts release only the component's listeners. Tool ownership is
+  // document-scoped and is retired by pagehide or an actual context replacement.
+  return { supported: true, ready, verify: verifyListingPilotTools, unregister: () => undefined };
 }
 
 export function resetWebMcpRegistrationForTests(): void {
-  if (activeRegistration) {
-    activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
-  }
+  activeRegistration?.retire();
   activeRegistration = null;
+  registrationBootstrap = null;
   pendingPublishes.clear();
   developmentDiagnostic = null;
 }

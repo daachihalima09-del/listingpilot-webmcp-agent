@@ -172,6 +172,71 @@ describe('WebMCP contracts', () => {
     expect([...secondRegistered.keys()]).toEqual(webMcpToolNames);
   });
 
+  it('waits for WebMCP to become available after refreshed-document hydration', async () => {
+    Reflect.deleteProperty(document, 'modelContext');
+    const registration = registerListingPilotTools();
+    expect(registration.supported).toBe(true);
+
+    const registered = new Map<string, { name: string }>();
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string }) => { registered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    queueMicrotask(() => Object.defineProperty(document, 'modelContext', { configurable: true, value: context }));
+
+    await expect(registration.ready).resolves.toEqual({
+      intendedTools: [...webMcpToolNames],
+      registeredTools: [...webMcpToolNames],
+      verified: true,
+    });
+    expect(context.registerTool).toHaveBeenCalledTimes(4);
+  });
+
+  it('waits out old-document duplicate names and verifies only refreshed-document handlers', async () => {
+    const oldDocumentTools = new Map<string, { name: string }>(webMcpToolNames.map((name) => [name, { name }]));
+    const refreshedDocumentTools = new Map<string, { name: string }>();
+    let reads = 0;
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string }) => {
+        if (oldDocumentTools.has(tool.name)) throw new DOMException('A same-name tool is still registered.', 'InvalidStateError');
+        refreshedDocumentTools.set(tool.name, tool);
+      }),
+      getTools: vi.fn(async () => {
+        reads += 1;
+        const visible = [...oldDocumentTools.values(), ...refreshedDocumentTools.values()];
+        if (reads === 1) queueMicrotask(() => oldDocumentTools.clear());
+        return visible;
+      }),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+
+    const result = await registerListingPilotTools().ready;
+    expect(result.registeredTools).toEqual(webMcpToolNames);
+    expect([...refreshedDocumentTools.keys()].sort()).toEqual([...webMcpToolNames].sort());
+    expect(context.registerTool).toHaveBeenCalledTimes(4);
+  });
+
+  it('retries a specification duplicate-name rejection after old ownership is released', async () => {
+    const refreshedDocumentTools = new Map<string, { name: string }>();
+    let oldDocumentOwnsNames = true;
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string }) => {
+        if (oldDocumentOwnsNames) {
+          queueMicrotask(() => { oldDocumentOwnsNames = false; });
+          throw new DOMException('A same-name tool is already registered.', 'InvalidStateError');
+        }
+        refreshedDocumentTools.set(tool.name, tool);
+      }),
+      getTools: vi.fn(async () => [...refreshedDocumentTools.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+
+    const result = await registerListingPilotTools().ready;
+    expect(result.registeredTools).toEqual(webMcpToolNames);
+    expect(context.registerTool).toHaveBeenCalledTimes(5);
+    expect([...refreshedDocumentTools.keys()].sort()).toEqual([...webMcpToolNames].sort());
+  });
+
   it('keeps publish registered through prepare, blocked publish, approval, and a later turn', async () => {
     const proposal = { proposalId: 'proposal_0002', workspaceId: 'workspace_atlas_demo', productId: 'prod_orion_vx65', focus: 'full_listing', original: { title: 'Old', description: 'Old' }, proposed: { title: 'Safe', description: 'Safe description' }, reasons: [], factRefs: [], evidenceRefs: [], warnings: [], status: 'AWAITING_APPROVAL', preparedAt: new Date().toISOString(), approvedAt: null, publishedAt: null, contentFingerprint: 'a'.repeat(64) };
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
@@ -181,7 +246,10 @@ describe('WebMCP contracts', () => {
     vi.stubGlobal('fetch', fetcher);
     const registered = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
     const context = {
-      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { registered.set(tool.name, tool); }),
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }, options?: { signal?: AbortSignal }) => {
+        registered.set(tool.name, tool);
+        options?.signal?.addEventListener('abort', () => registered.delete(tool.name), { once: true });
+      }),
       getTools: vi.fn(async () => [...registered.values()]),
     };
     Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
@@ -222,7 +290,10 @@ describe('WebMCP contracts', () => {
     vi.stubGlobal('fetch', routeFetcher);
     const registered = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
     const context = {
-      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { registered.set(tool.name, tool); }),
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }, options?: { signal?: AbortSignal }) => {
+        registered.set(tool.name, tool);
+        options?.signal?.addEventListener('abort', () => registered.delete(tool.name), { once: true });
+      }),
       getTools: vi.fn(async () => [...registered.values()]),
     };
     Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
@@ -255,7 +326,8 @@ describe('WebMCP contracts', () => {
       { signal: new AbortController().signal },
     )).resolves.toMatchObject({ ok: false, status: 'BLOCKED', code: 'HUMAN_APPROVAL_REQUIRED', proposalId: otherPrepared.proposal.proposalId });
 
-    resetWebMcpRegistrationForTests();
+    window.dispatchEvent(new Event('pagehide'));
+    expect(registered.size).toBe(0);
     const reloadedTools = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
     const reloadedContext = {
       registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { reloadedTools.set(tool.name, tool); }),

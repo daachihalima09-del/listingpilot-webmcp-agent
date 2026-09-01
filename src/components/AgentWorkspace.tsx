@@ -74,7 +74,10 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   useEffect(() => {
     const registration = registerListingPilotTools();
     if (!registration.supported) queueMicrotask(() => setWebMcpState('unsupported'));
-    else registration.ready.then((result) => { setRegisteredToolNames(result.registeredTools); setWebMcpState(result.registeredTools.length === webMcpToolNames.length ? 'ready' : 'error'); }).catch(() => setWebMcpState('error'));
+    else registration.ready.then((result) => { setRegisteredToolNames(result.registeredTools); setWebMcpState(result.registeredTools.length === webMcpToolNames.length ? 'ready' : 'error'); }).catch((cause: unknown) => {
+      setRegisteredToolNames([]);
+      setWebMcpState(cause instanceof DOMException && cause.name === 'NotSupportedError' ? 'unsupported' : 'error');
+    });
     const handleResult = (event: Event) => {
       const detail = (event as CustomEvent<WebMcpResultEvent>).detail;
       if (detail.kind === 'search') setProducts(detail.products);
