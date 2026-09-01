@@ -1,12 +1,12 @@
 import 'server-only';
 
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { Redis } from '@upstash/redis';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import type { ChallengeSessionDiagnostic } from '@/domain/contracts';
 import { CHALLENGE_SESSION_HEADER, CHALLENGE_SESSION_TTL_SECONDS, isChallengeSessionToken } from '@/session/challenge-session';
 import { ChallengeError } from './errors';
+import { createProductionRedisSessionStore, type SessionStore } from './redis-session-store.server';
 import { createChallengeState, type ChallengeState } from './store';
 
 const proposalSchema = z.object({
@@ -48,15 +48,9 @@ export interface ChallengeSession {
   revision: number;
 }
 
-interface SessionStore {
-  get(key: string): Promise<string | null>;
-  create(key: string, value: string): Promise<boolean>;
-  compareAndSet(key: string, expected: string, value: string): Promise<boolean>;
-  delete(key: string): Promise<void>;
-}
-
 const memoryStore = new Map<string, string>();
 let memoryStoreEnabled = process.env.NODE_ENV !== 'production';
+let sessionStoreOverride: SessionStore | null = null;
 
 function stateSecret(): string {
   const configured = process.env.CHALLENGE_STATE_SECRET;
@@ -65,24 +59,9 @@ function stateSecret(): string {
   throw new ChallengeError('SESSION_STORE_UNAVAILABLE', 'Challenge session persistence is not configured.', 503);
 }
 
-function redisStore(): SessionStore {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) throw new ChallengeError('SESSION_STORE_UNAVAILABLE', 'Challenge session persistence is not configured.', 503);
-  const redis = new Redis({ url, token });
-  return {
-    get: async (key) => await redis.get<string>(key),
-    create: async (key, value) => (await redis.set(key, value, { nx: true, ex: CHALLENGE_SESSION_TTL_SECONDS })) === 'OK',
-    compareAndSet: async (key, expected, value) => (await redis.eval<[string, string, number], number>(
-      "if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end",
-      [key], [expected, value, CHALLENGE_SESSION_TTL_SECONDS],
-    )) === 1,
-    delete: async (key) => { await redis.del(key); },
-  };
-}
-
 function store(): SessionStore {
-  if (!memoryStoreEnabled) return redisStore();
+  if (sessionStoreOverride) return sessionStoreOverride;
+  if (!memoryStoreEnabled) return createProductionRedisSessionStore();
   return {
     get: async (key) => memoryStore.get(key) ?? null,
     create: async (key, value) => { if (memoryStore.has(key)) return false; memoryStore.set(key, value); return true; },
@@ -117,7 +96,13 @@ function encodeRecord(record: DurableRecord): string {
 }
 
 function decodeRecord(value: string): DurableRecord {
-  return recordSchema.parse(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
+  try {
+    return recordSchema.parse(JSON.parse(Buffer.from(value, 'base64url').toString('utf8')));
+  } catch {
+    const reference = randomUUID();
+    console.error('Challenge session record is invalid.', { event: 'challenge.session.corrupt', reference });
+    throw new ChallengeError('SESSION_STATE_CORRUPT', 'Stored challenge state is invalid. Reset the demo and try again.', 500, reference);
+  }
 }
 
 function freshRecord(token: string, workspaceId: string): DurableRecord {
@@ -179,6 +164,13 @@ export async function deleteChallengeSession(session: ChallengeSession): Promise
   await store().delete(session.key);
 }
 
+export async function deleteChallengeSessionByRequest(request: Request): Promise<void> {
+  const supplied = request.headers.get(CHALLENGE_SESSION_HEADER);
+  if (!supplied) return;
+  if (!verifySessionToken(supplied)) throw new ChallengeError('SESSION_STATE_INVALID', 'Challenge session state is invalid. Clear site data and try again.', 400);
+  await store().delete(sessionKey(supplied));
+}
+
 export function attachChallengeSession(response: NextResponse, session: ChallengeSession): NextResponse {
   response.headers.set(CHALLENGE_SESSION_HEADER, session.token);
   response.headers.set('Cache-Control', 'no-store');
@@ -193,4 +185,11 @@ export function challengeSessionDiagnostic(session: ChallengeSession, proposalId
 export function resetDurableSessionStoreForTests(): void {
   memoryStore.clear();
   memoryStoreEnabled = true;
+  sessionStoreOverride = null;
+}
+
+export function setDurableSessionStoreForTests(testStore: SessionStore): void {
+  memoryStore.clear();
+  memoryStoreEnabled = true;
+  sessionStoreOverride = testStore;
 }

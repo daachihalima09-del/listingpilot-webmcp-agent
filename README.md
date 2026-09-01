@@ -60,7 +60,9 @@ npm install
 npm run dev
 ```
 
-Set `CHALLENGE_STATE_SECRET` in `.env.local` and in Vercel to a random value of at least 32 characters. Production also requires `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`; it intentionally returns a safe configuration error instead of using volatile memory when they are absent. Local development and tests use bounded in-memory state. Open `http://localhost:3000`. The app makes no OpenAI or Shopify calls.
+Set `CHALLENGE_STATE_SECRET` in `.env.local` and in Vercel to a random value of at least 32 characters. Production also requires `UPSTASH_REDIS_REST_URL` and the normal **write-enabled** `UPSTASH_REDIS_REST_TOKEN`—the read-only token cannot create, approve, publish, or reset challenge state. Apply all three variables to the Vercel environment being tested and redeploy after changing them. Production intentionally returns a bounded configuration, authentication, permission, connectivity, command-compatibility, or state-integrity error with a correlation reference instead of using volatile memory. Local development and tests use bounded in-memory state. Open `http://localhost:3000`. The app makes no OpenAI or Shopify calls.
+
+The Redis adapter uses only `GET`, `SET ... NX EX`, `EVAL` for atomic compare-and-set (`GET` plus `SET ... EX`), and `DEL`. Upstash Redis scripting supports the CAS operation; retaining it prevents an older request from overwriting newer approval or publication state.
 
 Quality gates:
 

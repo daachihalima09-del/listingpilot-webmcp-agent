@@ -22,8 +22,11 @@ function keepNewestProposal(current: ListingProposal | null, incoming: ListingPr
 
 async function jsonRequest<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await challengeFetch(fetch, input, init);
-  const body = await response.json() as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(body.error?.message ?? 'The request could not be completed.');
+  const body = await response.json() as T & { error?: { message?: string; reference?: string } };
+  if (!response.ok) {
+    const reference = body.error?.reference ? ` Reference: ${body.error.reference}.` : '';
+    throw new Error(`${body.error?.message ?? 'The request could not be completed.'}${reference}`);
+  }
   return body;
 }
 

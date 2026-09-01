@@ -32,10 +32,11 @@ let activeRegistration: ActiveRegistration | null = null;
 const pendingPublishes = new Map<string, Promise<{ result: PublishResult; proposal: ListingProposal }>>();
 
 async function responseJson<T>(response: Response): Promise<T> {
-  const body = await response.json() as T & { error?: { message?: string } };
+  const body = await response.json() as T & { error?: { message?: string; reference?: string } };
   if (!response.ok) {
-    const error = body.error as { code?: string; message?: string } | undefined;
-    throw new Error(`${error?.code ? `${error.code}: ` : ''}${error?.message ?? 'The ListingPilot Agent request failed.'}`);
+    const error = body.error as { code?: string; message?: string; reference?: string } | undefined;
+    const reference = error?.reference ? ` Reference: ${error.reference}.` : '';
+    throw new Error(`${error?.code ? `${error.code}: ` : ''}${error?.message ?? 'The ListingPilot Agent request failed.'}${reference}`);
   }
   return body;
 }

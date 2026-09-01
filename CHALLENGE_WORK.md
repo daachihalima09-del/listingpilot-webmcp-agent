@@ -32,3 +32,11 @@
 - Replaced focus/visibility/interval registration repairs with one registration per document `ModelContext`, `getTools()` verification, and `toolchange` reconciliation.
 - Documented the platform boundary: the page can expose tools for its document, but cannot force ChatGPT to keep that page attached as the current site-tools source across a separate confirmation turn.
 - Kept exactly four WebMCP tools, with no agent-callable approval transition, and introduced no OpenAI or Shopify integration.
+
+## Day 2.4.1 — production Redis diagnostics
+
+- Isolated the Upstash command adapter and added production-shaped contract coverage for `GET`, `SET NX EX`, atomic Lua CAS, and `DEL`.
+- Classified configuration, authentication, permission, connectivity, command-support, general provider, stale-revision, and malformed-state failures with safe correlation references.
+- Ensured provider error messages, Redis keys, session bearers, stored payloads, and credentials never appear in client responses or bounded diagnostic logs.
+- Documented that production requires the normal write-enabled Upstash REST token in the exact Vercel environment being deployed.
+- Retained atomic Lua CAS because Upstash supports scripting and a multi-request replacement would allow stale state regression.
