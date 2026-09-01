@@ -23,7 +23,7 @@ export const prepareListingToolSchema = {
 export const publishApprovedToolSchema = {
   type: 'object', additionalProperties: false,
   properties: {
-    proposalId: { type: 'string', pattern: '^proposal_[0-9]+$', maxLength: 32, description: 'An already human-approved proposal ID returned by prepare_listing_improvement.' },
+    proposalId: { type: 'string', description: 'The approved proposal ID to publish.' },
   },
   required: ['proposalId'],
 } as const;

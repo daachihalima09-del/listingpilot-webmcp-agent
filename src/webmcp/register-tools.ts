@@ -20,6 +20,13 @@ export interface WebMcpRegistrationResult {
   verified: boolean;
 }
 
+export interface WebMcpDevelopmentDiagnostic {
+  intendedTools: Array<{ name: string; executeCallable: boolean }>;
+  registeredTools: string[];
+  registrationCompleted: boolean;
+  registrationError: string | null;
+}
+
 interface ActiveRegistration {
   context: NonNullable<Document['modelContext']>;
   controller: AbortController;
@@ -30,6 +37,38 @@ interface ActiveRegistration {
 
 let activeRegistration: ActiveRegistration | null = null;
 const pendingPublishes = new Map<string, Promise<{ result: PublishResult; proposal: ListingProposal }>>();
+let developmentDiagnostic: WebMcpDevelopmentDiagnostic | null = null;
+
+function recordDevelopmentDiagnostic(
+  definitions: ToolDefinition[],
+  registeredTools: string[],
+  registrationCompleted: boolean,
+  error?: unknown,
+): void {
+  if (process.env.NODE_ENV === 'production') return;
+  const registrationError = error && typeof error === 'object' && 'name' in error && typeof error.name === 'string'
+    ? error.name.slice(0, 64)
+    : error ? 'UnknownError' : null;
+  developmentDiagnostic = {
+    intendedTools: definitions.map((tool) => ({ name: tool.name, executeCallable: typeof tool.execute === 'function' })),
+    registeredTools: [...registeredTools],
+    registrationCompleted,
+    registrationError,
+  };
+  if (process.env.NODE_ENV === 'development') {
+    const method = error ? 'error' : 'info';
+    console[method]('[ListingPilot WebMCP registration]', developmentDiagnostic);
+  }
+}
+
+export function getWebMcpDevelopmentDiagnostic(): WebMcpDevelopmentDiagnostic | null {
+  if (process.env.NODE_ENV === 'production' || !developmentDiagnostic) return null;
+  return {
+    ...developmentDiagnostic,
+    intendedTools: developmentDiagnostic.intendedTools.map((tool) => ({ ...tool })),
+    registeredTools: [...developmentDiagnostic.registeredTools],
+  };
+}
 
 async function responseJson<T>(response: Response): Promise<T> {
   const body = await response.json() as T & { error?: { message?: string; reference?: string } };
@@ -107,23 +146,41 @@ function createRegistration(context: NonNullable<Document['modelContext']>): Act
   const controller = new AbortController();
   const definitions = createWebMcpTools();
   const intendedTools = definitions.map((tool) => tool.name);
+  recordDevelopmentDiagnostic(definitions, [], false);
   let reconciliation: Promise<WebMcpRegistrationResult> | null = null;
   const reconcile = async (): Promise<WebMcpRegistrationResult> => {
     if (reconciliation) return reconciliation;
     reconciliation = (async () => {
-      const discovered = await context.getTools();
-      const registeredNames = discovered.map((tool) => tool.name);
-      const missing = definitions.filter((tool) => !registeredNames.includes(tool.name));
-      if (missing.length > 0) await Promise.all(missing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-      const verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-      if (!intendedTools.every((name) => verifiedNames.includes(name))) throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
-      return { intendedTools, registeredTools: verifiedNames, verified: true };
+      try {
+        const discovered = await context.getTools();
+        const registeredNames = discovered.map((tool) => tool.name);
+        const missing = definitions.filter((tool) => !registeredNames.includes(tool.name));
+        if (missing.length > 0) await Promise.all(missing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
+        const verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+        if (!intendedTools.every((name) => verifiedNames.includes(name))) throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
+        recordDevelopmentDiagnostic(definitions, verifiedNames, true);
+        return { intendedTools, registeredTools: verifiedNames, verified: true };
+      } catch (error) {
+        recordDevelopmentDiagnostic(definitions, [], false, error);
+        throw error;
+      }
     })();
     try { return await reconciliation; } finally { reconciliation = null; }
   };
   const ready = (async () => {
-    await Promise.all(definitions.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-    return reconcile();
+    try {
+      await Promise.all(definitions.map((tool) => context.registerTool(tool, { signal: controller.signal })));
+      return await reconcile();
+    } catch (error) {
+      let registeredNames: string[] = [];
+      try {
+        registeredNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+      } catch {
+        // The original registration error is authoritative.
+      }
+      recordDevelopmentDiagnostic(definitions, registeredNames, false, error);
+      throw error;
+    }
   })();
   const handleToolChange = () => { void reconcile().catch(() => undefined); };
   const registration: ActiveRegistration = { context, controller, ready, reconcile, handleToolChange };
@@ -155,6 +212,7 @@ export function resetWebMcpRegistrationForTests(): void {
   }
   activeRegistration = null;
   pendingPublishes.clear();
+  developmentDiagnostic = null;
 }
 
 export function parseToolInputForTests(toolName: string, value: unknown) {

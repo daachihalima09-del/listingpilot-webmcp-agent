@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createWebMcpTools, parseToolInputForTests, registerListingPilotTools, resetWebMcpRegistrationForTests } from './register-tools';
-import { webMcpToolNames } from './tool-contracts';
+import { createWebMcpTools, getWebMcpDevelopmentDiagnostic, parseToolInputForTests, registerListingPilotTools, resetWebMcpRegistrationForTests } from './register-tools';
+import { publishApprovedToolSchema, webMcpToolNames } from './tool-contracts';
+import { POST as prepareProposalRoute } from '@/app/api/proposals/route';
+import { POST as approveProposalRoute } from '@/app/api/proposals/[proposalId]/approve/route';
+import { POST as publishProposalRoute } from '@/app/api/proposals/[proposalId]/publish/route';
+import { challengeFetch } from '@/session/challenge-fetch';
+import { resetDurableSessionStoreForTests } from '@/server/durable-session.server';
 
 afterEach(() => {
   resetWebMcpRegistrationForTests();
@@ -28,6 +33,18 @@ describe('WebMCP contracts', () => {
     expect(() => parseToolInputForTests('prepare_listing_improvement', { productId: 'prod_orion_vx65', status: 'APPROVED' })).toThrow();
     expect(() => parseToolInputForTests('publish_approved_changes', { proposalId: 'proposal_0001', approved: true })).toThrow();
     expect(() => parseToolInputForTests('publish_approved_changes', { proposalId: '../proposal_0001' })).toThrow();
+  });
+
+  it('uses the smallest standards-safe publish schema while retaining strict runtime validation', () => {
+    expect(publishApprovedToolSchema).toEqual({
+      type: 'object',
+      properties: {
+        proposalId: { type: 'string', description: 'The approved proposal ID to publish.' },
+      },
+      required: ['proposalId'],
+      additionalProperties: false,
+    });
+    expect(() => parseToolInputForTests('publish_approved_changes', { proposalId: 'invalid' })).toThrow();
   });
 
   it('marks data-bearing outputs untrusted and read tools read-only', () => {
@@ -57,6 +74,12 @@ describe('WebMCP contracts', () => {
     expect(registrations.map((entry) => entry.name)).toEqual(webMcpToolNames);
     expect(result).toEqual({ intendedTools: [...webMcpToolNames], registeredTools: [...webMcpToolNames], verified: true });
     expect(remountResult).toEqual(result);
+    expect(getWebMcpDevelopmentDiagnostic()).toEqual({
+      intendedTools: webMcpToolNames.map((name) => ({ name, executeCallable: true })),
+      registeredTools: [...webMcpToolNames],
+      registrationCompleted: true,
+      registrationError: null,
+    });
     second.unregister();
     expect(firstSignal?.aborted).toBe(false);
     expect([...registered.keys()].sort()).toEqual([...webMcpToolNames].sort());
@@ -78,6 +101,26 @@ describe('WebMCP contracts', () => {
     expect(result.registeredTools).toEqual(webMcpToolNames);
     expect(publishAttempts).toBe(2);
     expect(context.registerTool).toHaveBeenCalledTimes(5);
+  });
+
+  it('records a bounded development diagnostic when initial registration throws', async () => {
+    const registered = new Map<string, { name: string }>();
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string }) => {
+        if (tool.name === 'publish_approved_changes') throw new DOMException('Rejected by test context.', 'InvalidStateError');
+        registered.set(tool.name, tool);
+      }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+
+    await expect(registerListingPilotTools().ready).rejects.toMatchObject({ name: 'InvalidStateError' });
+    expect(getWebMcpDevelopmentDiagnostic()).toEqual({
+      intendedTools: webMcpToolNames.map((name) => ({ name, executeCallable: true })),
+      registeredTools: webMcpToolNames.slice(0, 3),
+      registrationCompleted: false,
+      registrationError: 'InvalidStateError',
+    });
   });
 
   it('recovers one disappeared tool without duplicating healthy registrations', async () => {
@@ -160,6 +203,60 @@ describe('WebMCP contracts', () => {
     expect([...registered.keys()]).toEqual(webMcpToolNames);
     expect(registered.has('publish_approved_changes')).toBe(true);
     expect([...registered.keys()].some((name) => /^approve/.test(name))).toBe(false);
+  });
+
+  it('executes the registered publish handler through prepare, human approval, publish, and idempotent replay', async () => {
+    resetDurableSessionStoreForTests();
+    const routeFetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, 'http://localhost');
+      const request = new Request(url, { ...init, signal: undefined });
+      if (url.pathname === '/api/proposals') return prepareProposalRoute(request);
+      const match = url.pathname.match(/^\/api\/proposals\/(proposal_\d+)\/(approve|publish)$/);
+      if (!match) throw new Error(`Unexpected synthetic API path: ${url.pathname}`);
+      const context = { params: Promise.resolve({ proposalId: match[1] }) };
+      return match[2] === 'approve' ? approveProposalRoute(request, context) : publishProposalRoute(request, context);
+    });
+    vi.stubGlobal('fetch', routeFetcher);
+    const registered = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
+    const context = {
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { registered.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...registered.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
+    await registerListingPilotTools().ready;
+
+    const prepared = await registered.get('prepare_listing_improvement')!.execute(
+      { productId: 'prod_orion_vx65' },
+      { signal: new AbortController().signal },
+    ) as { proposal: { proposalId: string; proposed: { title: string; description: string } } };
+    const publishTool = registered.get('publish_approved_changes')!;
+    await expect(publishTool.execute(
+      { proposalId: prepared.proposal.proposalId },
+      { signal: new AbortController().signal },
+    )).rejects.toThrow('HUMAN_APPROVAL_REQUIRED');
+    await Promise.resolve();
+
+    const approval = await challengeFetch(routeFetcher as unknown as typeof fetch, `/api/proposals/${prepared.proposal.proposalId}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-listingpilot-human-action': 'review-ui' },
+      body: JSON.stringify({ humanConfirmation: true }),
+    });
+    expect(approval.status).toBe(200);
+
+    const published = await publishTool.execute(
+      { proposalId: prepared.proposal.proposalId },
+      { signal: new AbortController().signal },
+    ) as { status: string; alreadyPublished: boolean; publishedProduct: { title: string; description: string } };
+    expect(published).toMatchObject({ status: 'PUBLISHED', alreadyPublished: false });
+    expect(published.publishedProduct).toMatchObject(prepared.proposal.proposed);
+    await Promise.resolve();
+
+    await expect(publishTool.execute(
+      { proposalId: prepared.proposal.proposalId },
+      { signal: new AbortController().signal },
+    )).resolves.toMatchObject({ status: 'PUBLISHED', alreadyPublished: true });
+    expect([...registered.keys()]).toEqual(webMcpToolNames);
+    expect(routeFetcher.mock.calls.filter(([input]) => String(input).endsWith('/publish'))).toHaveLength(3);
   });
 
   it('does not confuse execution cancellation with registration lifetime', async () => {
