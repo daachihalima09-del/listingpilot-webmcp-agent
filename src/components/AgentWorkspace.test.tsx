@@ -99,7 +99,7 @@ describe('agent workspace proposal lifecycle', () => {
     expect(screen.getByRole('heading', { name: 'AI speed. Verified truth. Human control.' })).toBeTruthy();
     expect(screen.getByText(/Review this catalog. Find the product that most needs improvement/)).toBeTruthy();
     expect(screen.getByText('search_products')).toBeTruthy();
-    expect(screen.getByText('inspect_product_truth')).toBeTruthy();
+    expect(screen.getByText('inspect_product')).toBeTruthy();
     expect(screen.getByText('prepare_listing_improvement')).toBeTruthy();
     expect(screen.getByText('publish_approved_changes')).toBeTruthy();
     expect(screen.getByText(/Approval is intentionally not exposed as a WebMCP tool/)).toBeTruthy();
@@ -107,5 +107,29 @@ describe('agent workspace proposal lifecycle', () => {
     expect(screen.getByText('CONFLICTING')).toBeTruthy();
     expect(screen.getByText('MISSING')).toBeTruthy();
     expect(screen.getByText('Manual Demo Controls')).toBeTruthy();
+    expect(screen.getByText('YOUR AGENT GOAL')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Copy agent goal' })).toBeTruthy();
+    expect(screen.getByText(/paste this goal, and let the agent use the tools below/)).toBeTruthy();
+    expect(screen.getByText('500 synthetic products')).toBeTruthy();
+    expect(screen.getByText(/Representative products shown · 3 interactive/)).toBeTruthy();
+    expect(screen.getAllByText('Waiting for agent').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Human review required')).toBeNull();
+  });
+
+  it('copies the agent goal without invoking a ListingPilot action', async () => {
+    const state = createChallengeState();
+    const products = searchProducts(state, DEMO_WORKSPACE_ID);
+    const inspection = inspectProduct(state, DEMO_WORKSPACE_ID, products[0].productId);
+    const writeText = vi.fn(async () => undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const fetcher = vi.fn(async () => Response.json({ activity: [], latestProposal: null, publishedProducts: [], diagnostic: { sessionState: 'DURABLE', revision: 1, proposalCount: 0, proposalFound: false, proposalState: null } }));
+    vi.stubGlobal('fetch', fetcher);
+
+    render(<AgentWorkspace initialProducts={products} initialInspection={inspection} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy agent goal' }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('Review this catalog. Find the product that most needs improvement, inspect its Product Truth, and prepare a safer listing using only verified facts. Do not approve or publish anything.'));
+    expect(screen.getByRole('button', { name: 'Agent goal copied' })).toBeTruthy();
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
