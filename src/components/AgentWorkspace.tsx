@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AuditEvent, ChallengeSessionDiagnostic, ListingProposal, ProductInspection, ProductSummary, PublishedProduct } from '@/domain/contracts';
 import { registerListingPilotTools } from '@/webmcp/register-tools';
+import { webMcpToolNames } from '@/webmcp/tool-contracts';
 import { WEBMCP_RESULT_EVENT, type WebMcpResultEvent } from '@/webmcp/tool-results';
 import { challengeFetch, clearChallengeSession } from '@/session/challenge-fetch';
 
@@ -15,6 +16,12 @@ const proposalStateRank: Record<ListingProposal['status'], number> = {
 };
 
 const recommendedAgentPrompt = 'Review this catalog. Find the product that most needs improvement, inspect its Product Truth, and prepare a safer listing using only verified facts. Do not approve or publish anything.';
+const webMcpCapabilityLabels: Record<(typeof webMcpToolNames)[number], string> = {
+  search_products: 'Find catalog opportunities',
+  inspect_product: 'Read verified product facts',
+  prepare_listing_improvement: 'Prepare a safe proposal',
+  publish_approved_changes: 'Publish only after human approval',
+};
 
 function keepNewestProposal(current: ListingProposal | null, incoming: ListingProposal | null): ListingProposal | null {
   if (!incoming) return current;
@@ -42,7 +49,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   const [proposal, setProposal] = useState<ListingProposal | null>(null);
   const [activity, setActivity] = useState<AuditEvent[]>([]);
   const [webMcpState, setWebMcpState] = useState<WebMcpState>('checking');
-  const [registeredToolCount, setRegisteredToolCount] = useState<number | null>(null);
+  const [registeredToolNames, setRegisteredToolNames] = useState<string[]>([]);
   const [sessionDiagnostic, setSessionDiagnostic] = useState<ChallengeSessionDiagnostic | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -67,7 +74,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
   useEffect(() => {
     const registration = registerListingPilotTools();
     if (!registration.supported) queueMicrotask(() => setWebMcpState('unsupported'));
-    else registration.ready.then((result) => { setRegisteredToolCount(result.registeredTools.length); setWebMcpState(result.registeredTools.length === 4 ? 'ready' : 'error'); }).catch(() => setWebMcpState('error'));
+    else registration.ready.then((result) => { setRegisteredToolNames(result.registeredTools); setWebMcpState(result.registeredTools.length === webMcpToolNames.length ? 'ready' : 'error'); }).catch(() => setWebMcpState('error'));
     const handleResult = (event: Event) => {
       const detail = (event as CustomEvent<WebMcpResultEvent>).detail;
       if (detail.kind === 'search') setProducts(detail.products);
@@ -148,7 +155,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
       <div><p className="eyebrow">LISTINGPILOT AGENT / WEBMCP COMMERCE COPILOT</p><h1>AI speed. Verified truth. Human control.</h1><p className="subtitle">Give your AI agent a commerce goal while the merchant keeps the final decision.</p></div>
       <div className="agent-status" aria-live="polite">
         <span className={`status-dot status-${webMcpState}`} aria-hidden="true" />
-        <span><strong>{webMcpState === 'ready' ? 'Agent tools ready' : webMcpState === 'unsupported' ? 'WebMCP preview' : webMcpState === 'error' ? 'Tool registration incomplete' : 'Checking WebMCP'}</strong><small>{webMcpState === 'ready' ? `${registeredToolCount ?? 4}/4 registered · approval stays human-only` : webMcpState === 'unsupported' ? 'Use ChatGPT Browser or enabled Chrome' : webMcpState === 'error' ? `${registeredToolCount ?? 0}/4 registered` : 'Secure registration lifecycle'}</small></span>
+        <span><strong>{webMcpState === 'ready' ? 'Agent tools ready' : webMcpState === 'unsupported' ? 'WebMCP preview' : webMcpState === 'error' ? 'Tool registration incomplete' : 'Checking WebMCP'}</strong><small>{webMcpState === 'ready' ? `${registeredToolNames.length}/${webMcpToolNames.length} registered · approval stays human-only` : webMcpState === 'unsupported' ? 'Use ChatGPT Browser or enabled Chrome' : webMcpState === 'error' ? `${registeredToolNames.length}/${webMcpToolNames.length} registered` : 'Secure registration lifecycle'}</small></span>
       </div>
     </header>
 
@@ -166,10 +173,7 @@ export function AgentWorkspace({ initialProducts, initialInspection }: { initial
       <div className="tool-panel" aria-label="WebMCP capabilities">
         <p className="eyebrow">WEBMCP CAPABILITIES</p>
         <ul>
-          <li><code>search_products</code><span>Find catalog opportunities</span></li>
-          <li><code>inspect_product</code><span>Read verified product facts</span></li>
-          <li><code>prepare_listing_improvement</code><span>Prepare a safe proposal</span></li>
-          <li><code>publish_approved_changes</code><span>Only after human approval</span></li>
+          {webMcpToolNames.map((name) => <li key={name}><code>{name}</code><span>{webMcpCapabilityLabels[name]} · <b className={registeredToolNames.includes(name) ? 'tool-registered' : 'tool-pending'}>{registeredToolNames.includes(name) ? 'Registered' : webMcpState === 'checking' ? 'Checking' : 'Unavailable'}</b></span></li>)}
         </ul>
         <p className="human-only-note"><strong>Human-only:</strong> Approve proposal. Approval is intentionally not exposed as a WebMCP tool.</p>
       </div>

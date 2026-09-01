@@ -29,14 +29,17 @@ export interface WebMcpDevelopmentDiagnostic {
 
 interface ActiveRegistration {
   context: NonNullable<Document['modelContext']>;
-  controller: AbortController;
   ready: Promise<WebMcpRegistrationResult>;
   reconcile: () => Promise<WebMcpRegistrationResult>;
   handleToolChange: () => void;
 }
 
 let activeRegistration: ActiveRegistration | null = null;
-const pendingPublishes = new Map<string, Promise<{ result: PublishResult; proposal: ListingProposal }>>();
+type PublishApiResponse =
+  | { ok: true; body: { result: PublishResult; proposal: ListingProposal } }
+  | { ok: false; code: string; message: string; reference: string | null };
+
+const pendingPublishes = new Map<string, Promise<PublishApiResponse>>();
 let developmentDiagnostic: WebMcpDevelopmentDiagnostic | null = null;
 
 function recordDevelopmentDiagnostic(
@@ -84,6 +87,25 @@ function toolFetch(fetcher: typeof fetch, input: RequestInfo | URL, init: Reques
   return challengeFetch(fetcher, input, init);
 }
 
+function boundedString(value: unknown, fallback: string, maxLength: number): string {
+  return typeof value === 'string' && value.length > 0 ? value.slice(0, maxLength) : fallback;
+}
+
+async function publishApiResponse(response: Response): Promise<PublishApiResponse> {
+  const body = await response.json().catch(() => null) as {
+    result?: PublishResult;
+    proposal?: ListingProposal;
+    error?: { code?: unknown; message?: unknown; reference?: unknown };
+  } | null;
+  if (response.ok && body?.result && body.proposal) return { ok: true, body: { result: body.result, proposal: body.proposal } };
+  return {
+    ok: false,
+    code: boundedString(body?.error?.code, 'PUBLISH_REQUEST_FAILED', 64),
+    message: boundedString(body?.error?.message, 'The approved proposal could not be published.', 240),
+    reference: typeof body?.error?.reference === 'string' ? body.error.reference.slice(0, 64) : null,
+  };
+}
+
 export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition[] {
   return [
     {
@@ -128,22 +150,54 @@ export function createWebMcpTools(fetcher: typeof fetch = fetch): ToolDefinition
         const input = publishProposalInputSchema.parse(untrusted);
         let pending = pendingPublishes.get(input.proposalId);
         if (!pending) {
-          pending = (async () => responseJson<{ result: PublishResult; proposal: ListingProposal }>(await toolFetch(fetcher, `/api/proposals/${encodeURIComponent(input.proposalId)}/publish`, {
-            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}), signal,
-          })))();
+          pending = (async () => {
+            try {
+              return await publishApiResponse(await toolFetch(fetcher, `/api/proposals/${encodeURIComponent(input.proposalId)}/publish`, {
+                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}), signal,
+              }));
+            } catch (error) {
+              if (error instanceof DOMException && error.name === 'AbortError') throw error;
+              return { ok: false, code: 'PUBLISH_REQUEST_FAILED', message: 'The approved proposal could not be published.', reference: null };
+            }
+          })();
           pendingPublishes.set(input.proposalId, pending);
           void pending.finally(() => pendingPublishes.delete(input.proposalId)).catch(() => undefined);
         }
-        const body = await pending;
-        revealWebMcpResult({ kind: 'publish', proposal: body.proposal, result: body.result });
-        return body.result;
+        const response = await pending;
+        if (!response.ok) {
+          return {
+            ok: false,
+            status: response.code === 'HUMAN_APPROVAL_REQUIRED' ? 'BLOCKED' : 'ERROR',
+            code: response.code,
+            proposalId: input.proposalId,
+            published: false,
+            approvalRequired: response.code === 'HUMAN_APPROVAL_REQUIRED',
+            retryable: response.code === 'HUMAN_APPROVAL_REQUIRED',
+            message: response.message,
+            reference: response.reference,
+          };
+        }
+        const { result, proposal } = response.body;
+        revealWebMcpResult({ kind: 'publish', proposal, result });
+        if (result.alreadyPublished) {
+          return {
+            ok: false,
+            status: 'ALREADY_PUBLISHED',
+            code: 'ALREADY_PUBLISHED',
+            proposalId: input.proposalId,
+            published: true,
+            approvalRequired: false,
+            retryable: false,
+            message: result.message,
+          };
+        }
+        return { ok: true, ...result };
       },
     },
   ];
 }
 
 function createRegistration(context: NonNullable<Document['modelContext']>): ActiveRegistration {
-  const controller = new AbortController();
   const definitions = createWebMcpTools();
   const intendedTools = definitions.map((tool) => tool.name);
   recordDevelopmentDiagnostic(definitions, [], false);
@@ -152,38 +206,40 @@ function createRegistration(context: NonNullable<Document['modelContext']>): Act
     if (reconciliation) return reconciliation;
     reconciliation = (async () => {
       try {
-        const discovered = await context.getTools();
-        const registeredNames = discovered.map((tool) => tool.name);
-        const missing = definitions.filter((tool) => !registeredNames.includes(tool.name));
-        if (missing.length > 0) await Promise.all(missing.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-        const verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+        let verifiedNames: string[] = [];
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const discoveredNames = (await context.getTools()).map((tool) => tool.name);
+          const missing = definitions.filter((tool) => !discoveredNames.includes(tool.name));
+          for (const tool of missing) {
+            try {
+              await context.registerTool(tool);
+            } catch (error) {
+              const concurrentlyRegistered = (await context.getTools()).some((registered) => registered.name === tool.name);
+              if (!concurrentlyRegistered) throw error;
+            }
+          }
+          verifiedNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+          if (intendedTools.every((name) => verifiedNames.includes(name))) break;
+        }
         if (!intendedTools.every((name) => verifiedNames.includes(name))) throw new Error(`WebMCP registration incomplete (${verifiedNames.length}/${intendedTools.length}).`);
         recordDevelopmentDiagnostic(definitions, verifiedNames, true);
         return { intendedTools, registeredTools: verifiedNames, verified: true };
       } catch (error) {
-        recordDevelopmentDiagnostic(definitions, [], false, error);
+        let registeredNames: string[] = [];
+        try {
+          registeredNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
+        } catch {
+          // Preserve the authoritative registration error.
+        }
+        recordDevelopmentDiagnostic(definitions, registeredNames, false, error);
         throw error;
       }
     })();
     try { return await reconciliation; } finally { reconciliation = null; }
   };
-  const ready = (async () => {
-    try {
-      await Promise.all(definitions.map((tool) => context.registerTool(tool, { signal: controller.signal })));
-      return await reconcile();
-    } catch (error) {
-      let registeredNames: string[] = [];
-      try {
-        registeredNames = (await context.getTools()).map((tool) => tool.name).filter((name) => intendedTools.includes(name));
-      } catch {
-        // The original registration error is authoritative.
-      }
-      recordDevelopmentDiagnostic(definitions, registeredNames, false, error);
-      throw error;
-    }
-  })();
+  const ready = reconcile();
   const handleToolChange = () => { void reconcile().catch(() => undefined); };
-  const registration: ActiveRegistration = { context, controller, ready, reconcile, handleToolChange };
+  const registration: ActiveRegistration = { context, ready, reconcile, handleToolChange };
   void ready.then(() => context.addEventListener?.('toolchange', handleToolChange)).catch(() => undefined);
   return registration;
 }
@@ -198,7 +254,6 @@ export function registerListingPilotTools(): { supported: boolean; ready: Promis
   if (!activeRegistration || activeRegistration.context !== document.modelContext) {
     if (activeRegistration) {
       activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
-      activeRegistration.controller.abort();
     }
     activeRegistration = createRegistration(document.modelContext);
   }
@@ -208,7 +263,6 @@ export function registerListingPilotTools(): { supported: boolean; ready: Promis
 export function resetWebMcpRegistrationForTests(): void {
   if (activeRegistration) {
     activeRegistration.context.removeEventListener?.('toolchange', activeRegistration.handleToolChange);
-    activeRegistration.controller.abort();
   }
   activeRegistration = null;
   pendingPublishes.clear();

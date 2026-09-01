@@ -66,11 +66,9 @@ describe('WebMCP contracts', () => {
     Object.defineProperty(document, 'modelContext', { configurable: true, value: context });
     const first = registerListingPilotTools();
     const result = await first.ready;
-    const firstSignal = registrations[0].signal;
     first.unregister();
     const second = registerListingPilotTools();
     const remountResult = await second.ready;
-    expect(firstSignal?.aborted).toBe(false);
     expect(registrations.map((entry) => entry.name)).toEqual(webMcpToolNames);
     expect(result).toEqual({ intendedTools: [...webMcpToolNames], registeredTools: [...webMcpToolNames], verified: true });
     expect(remountResult).toEqual(result);
@@ -81,7 +79,6 @@ describe('WebMCP contracts', () => {
       registrationError: null,
     });
     second.unregister();
-    expect(firstSignal?.aborted).toBe(false);
     expect([...registered.keys()].sort()).toEqual([...webMcpToolNames].sort());
   });
 
@@ -192,7 +189,13 @@ describe('WebMCP contracts', () => {
     await registration.ready;
 
     await registered.get('prepare_listing_improvement')!.execute({ productId: proposal.productId }, { signal: new AbortController().signal });
-    await expect(registered.get('publish_approved_changes')!.execute({ proposalId: proposal.proposalId }, { signal: new AbortController().signal })).rejects.toThrow('HUMAN_APPROVAL_REQUIRED');
+    await expect(registered.get('publish_approved_changes')!.execute({ proposalId: proposal.proposalId }, { signal: new AbortController().signal })).resolves.toMatchObject({
+      ok: false,
+      status: 'BLOCKED',
+      code: 'HUMAN_APPROVAL_REQUIRED',
+      approvalRequired: true,
+      published: false,
+    });
     await Promise.resolve();
     expect(registered.has('publish_approved_changes')).toBe(true);
 
@@ -229,11 +232,15 @@ describe('WebMCP contracts', () => {
       { productId: 'prod_orion_vx65' },
       { signal: new AbortController().signal },
     ) as { proposal: { proposalId: string; proposed: { title: string; description: string } } };
+    const otherPrepared = await registered.get('prepare_listing_improvement')!.execute(
+      { productId: 'prod_aeronest_ap5' },
+      { signal: new AbortController().signal },
+    ) as { proposal: { proposalId: string } };
     const publishTool = registered.get('publish_approved_changes')!;
     await expect(publishTool.execute(
       { proposalId: prepared.proposal.proposalId },
       { signal: new AbortController().signal },
-    )).rejects.toThrow('HUMAN_APPROVAL_REQUIRED');
+    )).resolves.toMatchObject({ ok: false, status: 'BLOCKED', code: 'HUMAN_APPROVAL_REQUIRED' });
     await Promise.resolve();
 
     const approval = await challengeFetch(routeFetcher as unknown as typeof fetch, `/api/proposals/${prepared.proposal.proposalId}/approve`, {
@@ -243,20 +250,36 @@ describe('WebMCP contracts', () => {
     });
     expect(approval.status).toBe(200);
 
-    const published = await publishTool.execute(
+    await expect(publishTool.execute(
+      { proposalId: otherPrepared.proposal.proposalId },
+      { signal: new AbortController().signal },
+    )).resolves.toMatchObject({ ok: false, status: 'BLOCKED', code: 'HUMAN_APPROVAL_REQUIRED', proposalId: otherPrepared.proposal.proposalId });
+
+    resetWebMcpRegistrationForTests();
+    const reloadedTools = new Map<string, { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }>();
+    const reloadedContext = {
+      registerTool: vi.fn(async (tool: { name: string; execute: (input: object, options: { signal: AbortSignal }) => Promise<unknown> }) => { reloadedTools.set(tool.name, tool); }),
+      getTools: vi.fn(async () => [...reloadedTools.values()]),
+    };
+    Object.defineProperty(document, 'modelContext', { configurable: true, value: reloadedContext });
+    await registerListingPilotTools().ready;
+    const reloadedPublishTool = reloadedTools.get('publish_approved_changes')!;
+    expect([...reloadedTools.keys()]).toEqual(webMcpToolNames);
+
+    const published = await reloadedPublishTool.execute(
       { proposalId: prepared.proposal.proposalId },
       { signal: new AbortController().signal },
-    ) as { status: string; alreadyPublished: boolean; publishedProduct: { title: string; description: string } };
-    expect(published).toMatchObject({ status: 'PUBLISHED', alreadyPublished: false });
+    ) as { ok: boolean; status: string; alreadyPublished: boolean; publishedProduct: { title: string; description: string } };
+    expect(published).toMatchObject({ ok: true, status: 'PUBLISHED', alreadyPublished: false });
     expect(published.publishedProduct).toMatchObject(prepared.proposal.proposed);
     await Promise.resolve();
 
-    await expect(publishTool.execute(
+    await expect(reloadedPublishTool.execute(
       { proposalId: prepared.proposal.proposalId },
       { signal: new AbortController().signal },
-    )).resolves.toMatchObject({ status: 'PUBLISHED', alreadyPublished: true });
-    expect([...registered.keys()]).toEqual(webMcpToolNames);
-    expect(routeFetcher.mock.calls.filter(([input]) => String(input).endsWith('/publish'))).toHaveLength(3);
+    )).resolves.toMatchObject({ ok: false, status: 'ALREADY_PUBLISHED', code: 'ALREADY_PUBLISHED', published: true });
+    expect([...reloadedTools.keys()]).toEqual(webMcpToolNames);
+    expect(routeFetcher.mock.calls.filter(([input]) => String(input).endsWith('/publish'))).toHaveLength(4);
   });
 
   it('does not confuse execution cancellation with registration lifetime', async () => {
@@ -311,9 +334,39 @@ describe('WebMCP contracts', () => {
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
   });
 
-  it('surfaces the server approval block with its stable error code', async () => {
+  it('returns the server approval block as a structured callable result', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify({ error: { code: 'HUMAN_APPROVAL_REQUIRED', message: 'Human approval is required before publishing.' } }), { status: 409, headers: { 'content-type': 'application/json' } }));
     const tool = createWebMcpTools(fetcher as unknown as typeof fetch).find((item) => item.name === 'publish_approved_changes')!;
-    await expect(tool.execute({ proposalId: 'proposal_0001' }, { signal: new AbortController().signal })).rejects.toThrow('HUMAN_APPROVAL_REQUIRED: Human approval is required');
+    await expect(tool.execute({ proposalId: 'proposal_0001' }, { signal: new AbortController().signal })).resolves.toEqual({
+      ok: false,
+      status: 'BLOCKED',
+      code: 'HUMAN_APPROVAL_REQUIRED',
+      proposalId: 'proposal_0001',
+      published: false,
+      approvalRequired: true,
+      retryable: true,
+      message: 'Human approval is required before publishing.',
+      reference: null,
+    });
+  });
+
+  it.each([
+    ['NOT_FOUND', 404, 'The proposal was not found.'],
+    ['FORBIDDEN', 403, 'The proposal is not accessible.'],
+    ['INVALID_TRANSITION', 409, 'The proposal no longer matches its verified challenge content.'],
+  ])('returns a bounded structured %s result without removing callability', async (code, status, message) => {
+    const fetcher = vi.fn(async () => Response.json({ error: { code, message, reference: 'safe-reference' } }, { status }));
+    const tool = createWebMcpTools(fetcher as unknown as typeof fetch).find((item) => item.name === 'publish_approved_changes')!;
+    await expect(tool.execute({ proposalId: 'proposal_0001' }, { signal: new AbortController().signal })).resolves.toMatchObject({
+      ok: false,
+      status: 'ERROR',
+      code,
+      proposalId: 'proposal_0001',
+      published: false,
+      approvalRequired: false,
+      retryable: false,
+      message,
+      reference: 'safe-reference',
+    });
   });
 });

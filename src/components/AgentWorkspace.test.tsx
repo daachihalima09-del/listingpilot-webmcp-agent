@@ -8,7 +8,15 @@ import { WEBMCP_RESULT_EVENT } from '@/webmcp/tool-results';
 import { AgentWorkspace } from './AgentWorkspace';
 
 vi.mock('@/webmcp/register-tools', () => ({
-  registerListingPilotTools: () => ({ supported: false, ready: Promise.resolve({ intendedTools: [], registeredTools: [], verified: false }), unregister: vi.fn() }),
+  registerListingPilotTools: () => ({
+    supported: true,
+    ready: Promise.resolve({
+      intendedTools: ['search_products', 'inspect_product', 'prepare_listing_improvement', 'publish_approved_changes'],
+      registeredTools: ['search_products', 'inspect_product', 'prepare_listing_improvement', 'publish_approved_changes'],
+      verified: true,
+    }),
+    unregister: vi.fn(),
+  }),
 }));
 
 afterEach(() => {
@@ -110,6 +118,7 @@ describe('agent workspace proposal lifecycle', () => {
     expect(screen.getByText('YOUR AGENT GOAL')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Copy agent goal' })).toBeTruthy();
     expect(screen.getByText(/paste this goal, and let the agent use the tools below/)).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByText('Registered')).toHaveLength(4));
     expect(screen.getByText('500 synthetic products')).toBeTruthy();
     expect(screen.getByText(/Representative products shown · 3 interactive/)).toBeTruthy();
     expect(screen.getAllByText('Waiting for agent').length).toBeGreaterThan(0);
